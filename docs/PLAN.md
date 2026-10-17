@@ -1,6 +1,6 @@
 # 百度网盘下载助手（MaiBot 插件）v2.0.0 实施计划
 
-> 状态：已批准，执行中。
+> 状态：已完成（v2.0.0）。
 > 本文档是实现与验收的唯一计划来源；每次功能提交后更新「进度」与「决策记录」。
 
 ## 进度
@@ -11,7 +11,21 @@
 - [x] 4. BaiduPCS-Go 镜像安装与账号登录
 - [x] 5. 分享文件精确转存
 - [x] 6. 下载任务、进度通知与文件发送
-- [ ] 7. 帮助、清理任务与项目文档
+- [x] 7. 帮助、清理任务与项目文档
+
+## 交付记录
+
+| 提交 | 内容 | 测试 |
+|---|---|---|
+| `571fb38` | 插件骨架、配置模型与日志系统 | 34 passed |
+| `4d80abb` | 管理员白名单与权限校验 | 56 passed |
+| `319c1e6` | 分享解析、目录浏览与会话缓存 | 72 passed |
+| `461f374` | BaiduPCS-Go 镜像安装与账号登录 | 99 passed |
+| `cee31ef` | 分享文件精确转存 | 120 passed |
+| `8b35506` | 下载任务、进度通知与文件发送 | 138 passed |
+| 本提交 | LLM 工具 `pan_list`、定时清理、README/ADAPTER/PROTOCOL、自检 | 146 passed |
+
+最终自检命令：`pytest`、`python -m json.tool _manifest.json`、`python scripts/selfcheck.py`。
 
 ## 1. 目标与验收标准
 
@@ -266,7 +280,7 @@ README.md .gitignore requirements-dev.txt pytest.ini
 4. `feat: 集成 BaiduPCS-Go 镜像安装与账号登录` — installer/client、`install/download/qrlogin/bduss/cookies/login/unlogin`、测试。
 5. `feat: 实现分享文件精确转存` — transfer、`pan_transfer`、errno 修复、测试。
 6. `feat: 实现下载任务、进度通知与文件发送` — download_manager/sender、`dir/file`、`pan_download_dir/pan_download_all`、清理、测试。
-7. `feat: 完善帮助、清理任务与项目文档` — 完整 help、README、`docs/ADAPTER.md`、`docs/PROTOCOL.md`、端到端假 ctx 测试、PLAN 完结。
+7. `feat: 完善帮助、清理任务与项目文档` — `pan_list` 工具、`CleanupScheduler`、README、`docs/ADAPTER.md`、`docs/PROTOCOL.md`、`scripts/selfcheck.py`、端到端假 ctx 测试、PLAN 完结。
 
 每个提交只含对应功能文件；批准后第一步先把本计划原样写入 `docs/PLAN.md`，此后每次提交更新其中的进度表。不推送远端，不修改 MaiBot 主程序。
 

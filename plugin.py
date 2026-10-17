@@ -31,10 +31,16 @@ from baidu_pan.access import (  # noqa: E402
     parse_target_identity,
 )
 from baidu_pan.account import load_cookie_header  # noqa: E402
-from baidu_pan.cleanup import FileManifest  # noqa: E402
+from baidu_pan.cleanup import CleanupScheduler, FileManifest  # noqa: E402
 from baidu_pan.config_file import ensure_config_file  # noqa: E402
 from baidu_pan.download_manager import DownloadManager, DownloadRequest  # noqa: E402
-from baidu_pan.errors import AuthError, BaiduPanError, DownloadError, PcsError  # noqa: E402
+from baidu_pan.errors import (  # noqa: E402
+    AuthError,
+    BaiduPanError,
+    DownloadError,
+    PcsError,
+    PermissionDeniedError,
+)
 from baidu_pan.logging_utils import configure_logging, detach_file_handler  # noqa: E402
 from baidu_pan.pcs_client import AccountInfo, PcsClient  # noqa: E402
 from baidu_pan.pcs_installer import PcsInstaller, binary_name  # noqa: E402
@@ -66,7 +72,13 @@ from baidu_pan.texts import (  # noqa: E402
     whitelist_missing_text,
     whitelist_removed_text,
 )
-from baidu_pan.utils import build_job_id, format_size, normalize_account, split_multi  # noqa: E402
+from baidu_pan.utils import (  # noqa: E402
+    build_job_id,
+    format_size,
+    normalize_account,
+    split_multi,
+    truncate_text,
+)
 from config import BaiduPanConfig  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -91,6 +103,7 @@ class BaiduPanPlugin(MaiBotPlugin):
         self._sender: FileSender | None = None
         self._manifest: FileManifest | None = None
         self._downloads: DownloadManager | None = None
+        self._cleanup: CleanupScheduler | None = None
         self._unloaded = False
 
     # ------------------------------------------------------------------ 生命周期
@@ -109,6 +122,8 @@ class BaiduPanPlugin(MaiBotPlugin):
             self._logger.error("白名单载入失败：%s", exc, exc_info=True)
         self._ensure_runtime()
         self._log_runtime_summary()
+        if self._cleanup is not None:
+            await self._cleanup.start()
         if self.config.account.auto_login and self.config.account.bduss:
             self._logger.info("检测到自动登录配置，开始后台登录")
             self._spawn(self._auto_login(), name="auto-login")
@@ -119,6 +134,12 @@ class BaiduPanPlugin(MaiBotPlugin):
         if self._unloaded:
             return
         self._unloaded = True
+        if self._cleanup is not None:
+            try:
+                await self._cleanup.stop()
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("停止清理任务时出现异常：%s", exc)
+            self._cleanup = None
         if self._downloads is not None:
             try:
                 await self._downloads.shutdown()
@@ -141,6 +162,8 @@ class BaiduPanPlugin(MaiBotPlugin):
         self._apply_logging()
         if self._downloads is not None:
             self._downloads.set_download_root(self._download_root())
+        if self._cleanup is not None:
+            await self._cleanup.restart()
         self._logger.info("%s 配置已更新（config_version=%s）", PLUGIN_NAME, version)
 
     # ------------------------------------------------------------------ 内部方法
@@ -327,6 +350,13 @@ class BaiduPanPlugin(MaiBotPlugin):
             manifest=self._manifest,
             logger=self._logger,
             max_concurrent=self.config.download.max_concurrent_jobs,
+        )
+        self._cleanup = CleanupScheduler(
+            manifest=self._manifest,
+            roots_provider=lambda: [self._download_root(), self._staging_dir()],
+            hour_provider=lambda: int(self.config.download.cleanup_hour),
+            retention_provider=lambda: int(self.config.download.retention_hours),
+            logger=self._logger,
         )
 
     # ------------------------------------------------------------------ 命令
@@ -732,6 +762,51 @@ class BaiduPanPlugin(MaiBotPlugin):
         return True, f"✅ 已受理目录下载：{node.name}（{format_size(size)}，任务 {job_id}）。完成后会发送文件。", 2
 
     # ------------------------------------------------------------------ LLM 工具
+
+    @Tool(
+        "pan_list",
+        brief_description="浏览百度网盘分享的目录结构",
+        detailed_description=(
+            "当用户发来百度网盘分享链接并询问“里面有什么/列目录/看看文件”时调用。"
+            "参数：link 为分享链接或 surl（可空，空时使用当前会话已分享）；"
+            "pwd 为提取码（可空）。工具只浏览、不转存、不下载；"
+            "返回目录树文本，可据此再调用 pan_download_dir/pan_transfer 等工具。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="link",
+                param_type=ToolParamType.STRING,
+                description="百度网盘分享链接或 surl；留空使用当前会话分享",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="pwd",
+                param_type=ToolParamType.STRING,
+                description="分享提取码；无提取码留空",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_pan_list(
+        self,
+        link: str = "",
+        pwd: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if not self.config.plugin.enabled:
+            return {"content": PLUGIN_DISABLED_TEXT}
+        identity = extract_identity(kwargs)
+        try:
+            if identity is not None and self._access().is_blacklisted(identity):
+                raise PermissionDeniedError()
+            tree = await self._tree_for(link, pwd, kwargs)
+            text = render_tree(tree, max_entries=self.config.share.entries_per_dir)
+            return {"content": truncate_text(text, 3800)}
+        except BaiduPanError as exc:
+            return {"content": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            self._logger.error("pan_list 异常：%s", exc, exc_info=True)
+            return {"content": "读取分享目录失败，请稍后重试或查看插件日志。"}
 
     @Tool(
         "pan_transfer",

@@ -502,3 +502,33 @@ async def test_download_tool_requires_whitelist(plugin_env, monkeypatch) -> None
         stream_id="stream-tool-deny",
     )
     assert "没有下载权限" in result["content"]
+
+
+async def test_pan_list_tool(plugin_env, monkeypatch) -> None:
+    plugin = plugin_env.plugin
+    await _prepare_browsed_share(plugin_env, monkeypatch, "stream-list")
+    result = await plugin.tool_pan_list(
+        platform="qq",
+        user_id="100",
+        stream_id="stream-list",
+    )
+    assert "📁 资料" in result["content"]
+    assert "📄 说明.txt" in result["content"]
+
+
+async def test_pan_list_tool_blacklist(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    monkeypatch.setattr(plugin_module, "ShareClient", FakeShareClient)
+    monkeypatch.setattr(plugin_module, "load_cookie_header", lambda path: "")
+    apply_config(
+        plugin_env.plugin,
+        access={"admin_users": "qq:100", "blacklist": "qq:100"},
+    )
+    result = await plugin_env.plugin.tool_pan_list(
+        link="1AbCdEf",
+        platform="qq",
+        user_id="100",
+        stream_id="stream-black",
+    )
+    assert "没有权限" in result["content"]

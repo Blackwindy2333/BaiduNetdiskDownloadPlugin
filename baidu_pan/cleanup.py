@@ -1,16 +1,18 @@
-"""本地下载文件清单与定时清理。
+"""本地下载文件清单与每日定时清理。
 
 只清理「插件自己下载/暂存」的文件，避免误删下载目录中的其他内容。
-清单写入 ``data_dir/state/cleanup_manifest.json``，采用原子写。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
 from .utils import atomic_write_json, now_iso, read_json
 
@@ -130,6 +132,82 @@ class FileManifest:
         return report
 
 
+class CleanupScheduler:
+    """每天在指定小时执行一次清理。"""
+
+    def __init__(
+        self,
+        *,
+        manifest: FileManifest,
+        roots_provider: Callable[[], list[Path]],
+        hour_provider: Callable[[], int],
+        retention_provider: Callable[[], int],
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self._manifest = manifest
+        self._roots_provider = roots_provider
+        self._hour_provider = hour_provider
+        self._retention_provider = retention_provider
+        self._logger = logger or logging.getLogger(__name__)
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    async def start(self) -> None:
+        hour = int(self._hour_provider())
+        if hour < 0:
+            self._logger.info("本地定时清理已关闭")
+            return
+        await self.stop()
+        self._task = asyncio.create_task(self._loop(), name="baidu-pan-cleanup")
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 关停不抛错
+            pass
+        self._task = None
+
+    async def restart(self) -> None:
+        await self.start()
+
+    async def _loop(self) -> None:
+        while True:
+            hour = int(self._hour_provider())
+            if hour < 0:
+                self._logger.info("本地定时清理已关闭，退出调度任务")
+                return
+            delay = seconds_until_hour(hour)
+            self._logger.info("本地清理将在 %.1f 分钟后执行（%02d:00）", delay / 60, hour)
+            await asyncio.sleep(delay)
+            try:
+                report = await asyncio.to_thread(self.run_once)
+                self._logger.info("定时清理：%s", report.summary())
+            except Exception as exc:  # noqa: BLE001 - 清理失败不杀循环
+                self._logger.error("定时清理异常：%s", exc, exc_info=True)
+            await asyncio.sleep(60)
+
+    def run_once(self) -> CleanupReport:
+        roots = [Path(root) for root in self._roots_provider()]
+        retention = max(1, int(self._retention_provider()))
+        return self._manifest.cleanup(roots, retention_hours=retention)
+
+
+def seconds_until_hour(hour: int, *, now: datetime | None = None) -> float:
+    """计算距离下一次本地时间 ``hour:00`` 的秒数。"""
+
+    current = now or datetime.now()
+    target = current.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= current:
+        target += timedelta(days=1)
+    return max(1.0, (target - current).total_seconds())
+
+
 def _is_within(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -138,4 +216,4 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-__all__ = ["CleanupReport", "FileManifest"]
+__all__ = ["CleanupReport", "CleanupScheduler", "FileManifest", "seconds_until_hour"]

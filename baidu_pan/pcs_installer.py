@@ -96,8 +96,7 @@ def asset_info(version: str, platform_key: str | None = None) -> AssetInfo:
         asset_name, size, sha256 = known
         return AssetInfo(version=version, platform_key=key, asset_name=asset_name, size=size, sha256=sha256)
     # 未知版本/平台：仍允许按 GitHub 命名规则下载，但无法校验摘要。
-    suffix = "windows-x64" if key.startswith("windows") else key
-    return AssetInfo(version=version, platform_key=key, asset_name=f"BaiduPCS-Go-{version}-{suffix}.zip", size=None, sha256=None)
+    return AssetInfo(version=version, platform_key=key, asset_name=f"BaiduPCS-Go-{version}-{key}.zip", size=None, sha256=None)
 
 
 class PcsInstaller:
