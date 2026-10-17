@@ -1,0 +1,8 @@
+# 开发依赖安装（优先使用国内镜像，任选其一）：
+#   清华：py -3.14 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements-dev.txt
+#   阿里：py -3.14 -m pip install -i https://mirrors.aliyun.com/pypi/simple -r requirements-dev.txt
+#   腾讯：py -3.14 -m pip install -i https://mirrors.cloud.tencent.com/pypi/simple -r requirements-dev.txt
+maibot-plugin-sdk>=2.14.0,<3
+httpx>=0.27.0
+pytest>=8.0
+pytest-asyncio>=0.23
