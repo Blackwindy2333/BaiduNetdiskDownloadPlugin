@@ -28,6 +28,7 @@ class DownloadRequest:
     share_url: str = ""
     expected_size: int = 0
     expected_names: list[str] = field(default_factory=list)
+    is_directory: bool = False
 
 
 class DownloadManager:
@@ -126,7 +127,7 @@ class DownloadManager:
             try:
                 run_dir.mkdir(parents=True, exist_ok=True)
                 pcs = self._pcs_factory()
-                timeout = self._resolve_timeout(config, request.expected_size)
+                timeout = self._resolve_timeout(config, request.expected_size, request.is_directory)
                 last_progress = [0.0]
 
                 def on_progress(progress: Any) -> None:
@@ -208,26 +209,44 @@ class DownloadManager:
                 job.status = "cancelled"
                 job.message = "任务已取消"
                 job.finished_at = now_iso()
+                self._register_partial(run_dir)
                 self._logger.info("下载任务已取消：job=%s", job.job_id)
                 raise
             except BaiduPanError as exc:
                 job.status = "failed"
                 job.message = str(exc)
                 job.finished_at = now_iso()
+                self._register_partial(run_dir)
                 self._logger.warning("下载任务失败：job=%s %s", job.job_id, exc)
                 self._schedule_notify(job.stream_id, f"❌ {request.display_name} 处理失败：{exc}")
             except Exception as exc:  # noqa: BLE001 - 任务异常只记录
                 job.status = "failed"
                 job.message = "任务异常"
                 job.finished_at = now_iso()
+                self._register_partial(run_dir)
                 self._logger.error("下载任务异常：job=%s %s", job.job_id, exc, exc_info=True)
                 self._schedule_notify(job.stream_id, f"❌ {request.display_name} 处理失败，请查看插件日志。")
 
+    def _register_partial(self, run_dir: Path) -> None:
+        """把失败/取消任务残留的部分文件登记进清理清单。"""
+
+        try:
+            if not run_dir.exists():
+                return
+            partial = [path for path in run_dir.rglob("*") if path.is_file()]
+            if partial:
+                self._manifest.add(partial)
+                self._logger.info("已登记 %d 个未完成任务文件，等待定时清理", len(partial))
+        except Exception as exc:  # noqa: BLE001 - 清理登记失败不阻断
+            self._logger.warning("登记未完成文件失败：%s", exc)
+
     @staticmethod
-    def _resolve_timeout(config: Any, size: int) -> float:
+    def _resolve_timeout(config: Any, size: int, is_directory: bool = False) -> float:
         configured = int(config.download.timeout_seconds)
         if configured > 0:
             return float(configured)
+        if is_directory:
+            return float(max(3600, int(size / (1024 * 1024) * 15) if size > 0 else 3600))
         if size > 0:
             return float(max(600, int(size / (1024 * 1024) * 15)))
         return 3600.0

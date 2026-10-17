@@ -165,6 +165,25 @@ def test_resolve_timeout() -> None:
     assert DownloadManager._resolve_timeout(
         BaiduPanConfig(download={"timeout_seconds": 0}), 0
     ) == 3600.0
+    assert DownloadManager._resolve_timeout(
+        BaiduPanConfig(download={"timeout_seconds": 0}), 10, True
+    ) == 3600.0
+
+
+async def test_partial_files_registered_on_failure(tmp_path: Path) -> None:
+    class PartialPcs(FakePcs):
+        async def download(self, paths, saveto: Path, *, overwrite=True, timeout, on_progress=None):
+            partial = Path(saveto) / "partial.bin"
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            partial.write_text("x", encoding="utf-8")
+            return DownloadOutcome(False, PcsResult(code=0, stdout="下载失败"), ["失败"])
+
+    manager, _sender, manifest, _notifications = build_manager(tmp_path, PartialPcs([]))
+    job = manager.submit(make_request())
+    await manager.wait_idle()
+    await manager.drain_notifications()
+    assert job.status == "failed"
+    assert manifest.files and manifest.files[0].name == "partial.bin"
 
 
 async def test_manager_shutdown_cancels_task(tmp_path: Path) -> None:

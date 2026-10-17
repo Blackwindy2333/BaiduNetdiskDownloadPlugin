@@ -718,6 +718,7 @@ class BaiduPanPlugin(MaiBotPlugin):
                 share_url=self._share_url(tree),
                 expected_size=expected_size,
                 expected_names=expected_names,
+                is_directory=any(node.is_dir for node in nodes),
             )
             if self._downloads is None:
                 raise DownloadError("下载管理器尚未初始化。")
