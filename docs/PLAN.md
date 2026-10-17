@@ -6,7 +6,7 @@
 ## 进度
 
 - [x] 1. 插件骨架、配置模型与日志系统
-- [ ] 2. 管理员白名单与权限校验
+- [x] 2. 管理员白名单与权限校验
 - [ ] 3. 分享解析、目录浏览与会话缓存
 - [ ] 4. BaiduPCS-Go 镜像安装与账号登录
 - [ ] 5. 分享文件精确转存
@@ -60,6 +60,7 @@ baidu_pan/
   errors.py               # 错误类型 + 中文错误文案
   logging_utils.py        # ctx.logger + RotatingFileHandler，脱敏
   config_file.py          # 配置文件检查与默认 TOML 生成
+  access.py               # 身份解析、管理员/白名单/黑名单判定、白名单持久化
   texts.py                # 用户可见中文文案（帮助/提示）
   utils.py                # 大小格式化、路径安全、原子 JSON、ID 解析
   access.py               # 管理员/白名单/黑名单判定与持久化
