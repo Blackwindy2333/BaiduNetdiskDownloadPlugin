@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from conftest import apply_config
+from baidu_pan.errors import AuthError
+from baidu_pan.models import ShareInfo, ShareNode, ShareTree
 from baidu_pan.texts import PLUGIN_DISABLED_TEXT, UNKNOWN_COMMAND_TEXT
 
 
@@ -120,3 +122,103 @@ async def test_status_command(plugin_env) -> None:
     assert success is True
     assert "管理员：1 人" in text
     assert "白名单：0 人" in text
+
+
+class FakeShareClient:
+    """记录调用并返回固定目录树的假分享客户端。"""
+
+    instances: list["FakeShareClient"] = []
+
+    def __init__(self, cookies: str, *, timeout: float, logger=None) -> None:
+        self.cookies = cookies
+        self.timeout = timeout
+        self.closed = False
+        self.resolved: tuple[str, str] | None = None
+        FakeShareClient.instances.append(self)
+
+    async def resolve(self, surl: str, pwd: str = "") -> ShareInfo:
+        self.resolved = (surl, pwd)
+        return ShareInfo(surl=surl, share_id="99", uk="88", pwd=pwd, bdstoken="tk", title="资料")
+
+    async def build_tree(self, info: ShareInfo, **kwargs) -> ShareTree:
+        self.tree_kwargs = kwargs
+        nodes = [
+            ShareNode(name="子目录", path="/子目录", is_dir=True),
+            ShareNode(name="说明.txt", path="/说明.txt", is_dir=False, size=2048),
+        ]
+        return ShareTree(info=info, root_name="资料", nodes=nodes)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def test_browse_share_and_look(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    FakeShareClient.instances.clear()
+    monkeypatch.setattr(plugin_module, "ShareClient", FakeShareClient)
+    monkeypatch.setattr(plugin_module, "load_cookie_header", lambda path: "BDUSS=fake")
+
+    args = "https://pan.baidu.com/s/1AbCdEf 提取码: 052x"
+    success, text, weight = await plugin_env.plugin.handle_pan(
+        **_admin_kwargs(args=args), stream_id="stream-1"
+    )
+    assert success is True
+    assert weight == 2
+    assert "📁 资料" in text
+    assert "📁 子目录/" in text
+    assert "📄 说明.txt  (2.00 KB)" in text
+
+    client = FakeShareClient.instances[0]
+    assert client.cookies == "BDUSS=fake"
+    assert client.resolved == ("1AbCdEf", "052x")
+    assert client.closed is True
+
+    success, text, _ = await plugin_env.plugin.handle_pan(
+        matched_groups={"args": "look"}, stream_id="stream-1"
+    )
+    assert success is True
+    assert "📁 资料" in text
+
+    success, text, _ = await plugin_env.plugin.handle_pan(
+        matched_groups={"args": "look"}, stream_id="other-stream"
+    )
+    assert success is True
+    assert "还没有缓存的分享" in text
+
+
+async def test_browse_without_login_is_anonymous(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    FakeShareClient.instances.clear()
+    monkeypatch.setattr(plugin_module, "ShareClient", FakeShareClient)
+
+    def _raise_auth(path: str) -> str:
+        raise AuthError()
+
+    monkeypatch.setattr(plugin_module, "load_cookie_header", _raise_auth)
+    success, text, _ = await plugin_env.plugin.handle_pan(
+        matched_groups={"args": "1AbCdEf"}, stream_id="stream-anon"
+    )
+    assert success is True
+    assert "📁 资料" in text
+    assert FakeShareClient.instances[0].cookies == ""
+
+
+async def test_ls_refreshes_cached_share(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    FakeShareClient.instances.clear()
+    monkeypatch.setattr(plugin_module, "ShareClient", FakeShareClient)
+    monkeypatch.setattr(plugin_module, "load_cookie_header", lambda path: "")
+
+    success, _, _ = await plugin_env.plugin.handle_pan(
+        matched_groups={"args": "1AbCdEf"}, stream_id="stream-ls"
+    )
+    assert success is True
+    success, text, _ = await plugin_env.plugin.handle_pan(
+        matched_groups={"args": "ls"}, stream_id="stream-ls"
+    )
+    assert success is True
+    assert "📁 资料" in text
+    assert FakeShareClient.instances[-1].resolved == ("1AbCdEf", "")

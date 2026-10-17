@@ -26,11 +26,19 @@ from baidu_pan.access import (  # noqa: E402
     extract_identity,
     parse_target_identity,
 )
+from baidu_pan.account import load_cookie_header  # noqa: E402
 from baidu_pan.config_file import ensure_config_file  # noqa: E402
 from baidu_pan.errors import BaiduPanError  # noqa: E402
 from baidu_pan.logging_utils import configure_logging, detach_file_handler  # noqa: E402
+from baidu_pan.share import (  # noqa: E402
+    ShareClient,
+    ShareSessionCache,
+    parse_share_input,
+    render_tree,
+)
 from baidu_pan.texts import (  # noqa: E402
     INVALID_TARGET_TEXT,
+    NO_SHARE_SESSION_TEXT,
     PLUGIN_DISABLED_TEXT,
     UNKNOWN_COMMAND_TEXT,
     build_help_text,
@@ -59,6 +67,7 @@ class BaiduPanPlugin(MaiBotPlugin):
         self._logger: logging.Logger = logging.getLogger("maibot_sdk.plugin")
         self._file_handler: logging.Handler | None = None
         self._whitelist: WhitelistStore | None = None
+        self._share_cache = ShareSessionCache()
         self._unloaded = False
 
     # ------------------------------------------------------------------ 生命周期
@@ -194,10 +203,14 @@ class BaiduPanPlugin(MaiBotPlugin):
                 "wlist": self._cmd_wlist,
                 "whitelist": self._cmd_wlist,
                 "status": self._cmd_status,
+                "ls": self._cmd_ls,
+                "look": self._cmd_look,
             }.get(subcommand)
-            if handler is None:
-                return True, UNKNOWN_COMMAND_TEXT, 2
-            return await handler(identity, rest, kwargs)
+            if handler is not None:
+                return await handler(identity, rest, kwargs)
+            if self._looks_like_share(args):
+                return await self._cmd_browse(identity, args, kwargs)
+            return True, UNKNOWN_COMMAND_TEXT, 2
         except BaiduPanError as exc:
             self._logger.info("/pan %s 被拒绝或失败：%s", args.split(maxsplit=1)[0] if args else "", exc)
             return True, str(exc), 2
@@ -258,6 +271,91 @@ class BaiduPanPlugin(MaiBotPlugin):
             ),
             2,
         )
+
+    # ------------------------------------------------------------------ 分享浏览
+
+    @staticmethod
+    def _looks_like_share(text: str) -> bool:
+        try:
+            parse_share_input(text)
+        except BaiduPanError:
+            return False
+        return True
+
+    @staticmethod
+    def _stream_key(kwargs: dict[str, Any]) -> str:
+        stream_id = str(kwargs.get("stream_id") or "").strip()
+        if stream_id:
+            return stream_id
+        identity = extract_identity(kwargs)
+        return identity.key if identity is not None else "default"
+
+    def _open_share_client(self) -> ShareClient:
+        """创建分享客户端；未登录时也允许匿名浏览公开分享。"""
+
+        cookies = ""
+        try:
+            cookies = load_cookie_header(self.config.download.baidu_pcs_go_path)
+        except BaiduPanError as exc:
+            self._logger.debug("未读取到百度网盘登录信息，将匿名浏览分享：%s", exc)
+        return ShareClient(cookies, timeout=20.0, logger=self._logger)
+
+    async def _cmd_browse(self, identity: Identity | None, raw: str, kwargs: dict[str, Any]) -> tuple[bool, str, int]:
+        """``/pan <链接> [提取码]``：解析并缓存当前分享目录树。"""
+
+        surl, pwd = parse_share_input(raw)
+        client = self._open_share_client()
+        try:
+            info = await client.resolve(surl, pwd)
+            tree = await client.build_tree(
+                info,
+                max_depth=self.config.share.max_depth,
+                max_items=self.config.share.max_items,
+                entries_per_dir=self.config.share.entries_per_dir,
+            )
+        finally:
+            await client.aclose()
+        key = self._stream_key(kwargs)
+        self._share_cache.put(key, tree)
+        self._logger.info(
+            "已浏览分享 %s：%d 个节点（用户 %s，会话 %s）",
+            info.share_id,
+            len(tree.nodes),
+            identity.key if identity is not None else "-",
+            key,
+        )
+        return True, render_tree(tree, max_entries=self.config.share.entries_per_dir), 2
+
+    async def _cmd_ls(self, identity: Identity | None, rest: str, kwargs: dict[str, Any]) -> tuple[bool, str, int]:
+        """``/pan ls`` 刷新当前分享，或 ``/pan ls <链接>`` 直接浏览。"""
+
+        if rest and self._looks_like_share(rest):
+            return await self._cmd_browse(identity, rest, kwargs)
+        key = self._stream_key(kwargs)
+        tree = self._share_cache.get(key, self.config.share.cache_ttl_minutes * 60)
+        if tree is None:
+            return True, NO_SHARE_SESSION_TEXT, 2
+        client = self._open_share_client()
+        try:
+            info = await client.resolve(tree.info.surl, tree.info.pwd)
+            refreshed = await client.build_tree(
+                info,
+                max_depth=self.config.share.max_depth,
+                max_items=self.config.share.max_items,
+                entries_per_dir=self.config.share.entries_per_dir,
+            )
+        finally:
+            await client.aclose()
+        self._share_cache.put(key, refreshed)
+        return True, render_tree(refreshed, max_entries=self.config.share.entries_per_dir), 2
+
+    async def _cmd_look(self, identity: Identity | None, rest: str, kwargs: dict[str, Any]) -> tuple[bool, str, int]:
+        """``/pan look`` 查看当前分享的缓存目录树。"""
+
+        tree = self._share_cache.get(self._stream_key(kwargs), self.config.share.cache_ttl_minutes * 60)
+        if tree is None:
+            return True, NO_SHARE_SESSION_TEXT, 2
+        return True, render_tree(tree, max_entries=self.config.share.entries_per_dir), 2
 
 
 def create_plugin() -> BaiduPanPlugin:

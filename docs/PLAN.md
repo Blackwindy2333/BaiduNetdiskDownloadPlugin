@@ -7,7 +7,7 @@
 
 - [x] 1. 插件骨架、配置模型与日志系统
 - [x] 2. 管理员白名单与权限校验
-- [ ] 3. 分享解析、目录浏览与会话缓存
+- [x] 3. 分享解析、目录浏览与会话缓存
 - [ ] 4. BaiduPCS-Go 镜像安装与账号登录
 - [ ] 5. 分享文件精确转存
 - [ ] 6. 下载任务、进度通知与文件发送
@@ -61,13 +61,12 @@ baidu_pan/
   logging_utils.py        # ctx.logger + RotatingFileHandler，脱敏
   config_file.py          # 配置文件检查与默认 TOML 生成
   access.py               # 身份解析、管理员/白名单/黑名单判定、白名单持久化
+  account.py              # 读取 BaiduPCS-Go 登录态（pcs_config.json → Cookie）
   texts.py                # 用户可见中文文案（帮助/提示）
   utils.py                # 大小格式化、路径安全、原子 JSON、ID 解析
-  access.py               # 管理员/白名单/黑名单判定与持久化
   baidu_api.py            # httpx 客户端：shorturlinfo/gettemplatevariable/verify/list/transfer/QR
   baidu_parser.py         # 链接/surl/提取码解析
-  share.py                # 分享解析、密码校验、目录树构建、精确项匹配
-  session.py              # 按 stream_id 的分享会话与 TTL/LRU 缓存
+  share.py                # 分享解析、密码校验、目录树构建与渲染、按 stream_id 的会话缓存
   transfer.py             # 转存、errno 映射、空间/冲突处理、自家分享直下
   pcs_installer.py        # 镜像下载、大小+SHA256 校验、解压、安装
   pcs_client.py           # BaiduPCS-Go 子进程封装：env/CLI/超时/输出解析
@@ -82,6 +81,8 @@ tests/
 docs/PLAN.md docs/ADAPTER.md docs/PROTOCOL.md
 README.md .gitignore requirements-dev.txt pytest.ini
 ```
+
+实现说明：为减少无意义分层，`baidu_api.py`/`baidu_parser.py` 的职责并入 `share.py`，会话缓存由 `ShareSessionCache` 承担；如后续协议扩展到转存/二维码，再评估是否拆分。
 
 模块只通过显式构造注入依赖（config/access/api/pcs/sender），不读全局单例，便于后续加功能与测试。
 
@@ -262,7 +263,7 @@ README.md .gitignore requirements-dev.txt pytest.ini
 
 1. `feat: 搭建插件骨架、配置模型与日志系统` — `_manifest.json`、`plugin.py`（生命周期/help/命令分发骨架）、`config.py`、`logging_utils.py`、`.gitignore`、`requirements-dev.txt`、`pytest.ini`、`docs/PLAN.md`、骨架测试。
 2. `feat: 实现管理员白名单与权限校验` — `access.py`、whitelist store、`add/del/wlist/status`、权限矩阵、测试。
-3. `feat: 实现分享解析、目录浏览与会话缓存` — 解析/API/树/session、`ls/look/默认链接`、`pan_list`、测试。
+3. `feat: 实现分享解析、目录浏览与会话缓存` — 解析/API/树/session、`ls/look/默认链接`、测试（`pan_list` 工具随第 7 项统一接入）。
 4. `feat: 集成 BaiduPCS-Go 镜像安装与账号登录` — installer/client、`install/download/qrlogin/bduss/cookies/login/unlogin`、测试。
 5. `feat: 实现分享文件精确转存` — transfer、`pan_transfer`、errno 修复、测试。
 6. `feat: 实现下载任务、进度通知与文件发送` — download_manager/sender、`dir/file`、`pan_download_dir/pan_download_all`、清理、测试。
