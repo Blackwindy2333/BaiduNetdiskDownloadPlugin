@@ -25,9 +25,10 @@
 | `8b35506` | 下载任务、进度通知与文件发送 | 138 passed |
 | `685b2f2` | LLM `pan_list`、定时清理、README/ADAPTER/PROTOCOL、自检 | 146 passed |
 | `2152daa` | 修复取消下载时子进程未终止 | 147 passed |
-| 本提交 | 支持 `/pan install --git` 直连安装，完善帮助与文档 | 148 passed |
+| `4ef260a` | 支持 `/pan install --git` 直连安装，完善帮助与文档 | 148 passed |
+| `e64bdf3` | 改进目录任务超时与失败残留文件清理 | 150 passed |
 
-最终自检命令：`pytest`、`python -m json.tool _manifest.json`、`python scripts/selfcheck.py`。
+最终自检命令：`pytest`（150 passed）、`python -m json.tool _manifest.json`、`python scripts/selfcheck.py`。
 
 ## 1. 目标与验收标准
 
