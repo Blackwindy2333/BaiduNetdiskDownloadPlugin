@@ -589,8 +589,13 @@ class BaiduPanPlugin(MaiBotPlugin):
         account_uid: int | None = None
         if self._pcs_executable().is_file():
             try:
-                account = await self._make_pcs_client().who()
+                pcs = self._make_pcs_client()
+                account = await pcs.who()
                 account_uid = account.uid if account is not None else None
+                try:
+                    await pcs.mkdir(self.config.transfer.cloud_save_dir)
+                except BaiduPanError as exc:
+                    self._logger.debug("创建云端转存目录失败（可能已存在）：%s", exc)
             except BaiduPanError as exc:
                 self._logger.debug("读取百度账号 uid 失败（不影响转存）：%s", exc)
 

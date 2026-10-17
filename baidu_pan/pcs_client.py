@@ -368,6 +368,9 @@ class PcsClient:
     async def rm(self, path: str) -> PcsResult:
         return await self.run(["rm", path], timeout=30)
 
+    async def mkdir(self, path: str) -> PcsResult:
+        return await self.run(["mkdir", path], timeout=15)
+
 
 def _login_failure_text(output: str) -> str:
     text = output.strip()
