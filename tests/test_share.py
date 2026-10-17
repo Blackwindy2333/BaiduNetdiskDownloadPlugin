@@ -11,6 +11,7 @@ from baidu_pan.errors import (
     PasswordInvalidError,
     PasswordRequiredError,
     ShareParseError,
+    TransferError,
 )
 from baidu_pan.models import ShareInfo, ShareTree
 from baidu_pan.share import (
@@ -54,6 +55,15 @@ def test_parse_share_input_bare_surl_and_explicit_pwd() -> None:
     surl, pwd = parse_share_input("1AbCdEf", password="abcd")
     assert surl == "1AbCdEf"
     assert pwd == "abcd"
+
+
+def test_parse_share_input_bare_pwd_token() -> None:
+    surl, pwd = parse_share_input("https://pan.baidu.com/s/1AbCdEf 052x")
+    assert surl == "1AbCdEf"
+    assert pwd == "052x"
+    surl, pwd = parse_share_input("1AbCdEf 052x")
+    assert surl == "1AbCdEf"
+    assert pwd == "052x"
 
 
 def test_parse_share_input_rejects_plain_words() -> None:
@@ -227,3 +237,76 @@ def test_session_cache_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(share_module.time, "monotonic", lambda: base + 120)
     assert cache.get("s1", 60) is None
     assert len(cache) == 0
+
+
+# --------------------------------------------------------------------------- 转存协议
+
+
+def _transfer_info() -> ShareInfo:
+    return ShareInfo(surl="1AbCdEf", share_id="1", uk="2", bdstoken="tk")
+
+
+def _transfer_client(payload: dict[str, Any]):
+    return make_client({"/share/transfer": json_response(payload)})
+
+
+async def test_transfer_success() -> None:
+    client, calls = _transfer_client(
+        {"errno": 0, "extra": {"list": [{"to": "/我的资源/临时/a.txt"}]}}
+    )
+    async with client:
+        result = await client.transfer(_transfer_info(), [11, 22], "/我的资源/临时")
+    assert result["own_share"] is False
+    assert result["filenames"] == ["/我的资源/临时/a.txt"]
+    body = calls[0].content.decode()
+    assert "fsidlist=%5B11%2C22%5D" in body or "fsidlist=[11,22]" in body
+    assert "path=" in body
+
+
+async def test_transfer_already_exists_is_success() -> None:
+    client, _ = _transfer_client({"errno": 4, "extra": {"list": [{"to": "a.txt"}]}})
+    async with client:
+        result = await client.transfer(_transfer_info(), [11], "/我的资源")
+    assert result["filenames"] == ["a.txt"]
+
+
+async def test_transfer_own_share_is_reported() -> None:
+    client, _ = _transfer_client({"errno": 2})
+    async with client:
+        result = await client.transfer(_transfer_info(), [11], "/我的资源")
+    assert result["own_share"] is True
+
+
+async def test_transfer_conflict_same_name_is_success() -> None:
+    client, _ = _transfer_client({"errno": 12, "info": [{"errno": -30}, {"errno": 0}]})
+    async with client:
+        result = await client.transfer(_transfer_info(), [11], "/我的资源")
+    assert result["errno"] == 12
+
+
+async def test_transfer_space_insufficient() -> None:
+    client, _ = _transfer_client({"errno": 12, "info": [{"errno": -32}], "show_msg": "空间不足"})
+    async with client:
+        with pytest.raises(TransferError):
+            await client.transfer(_transfer_info(), [11], "/我的资源")
+
+
+async def test_transfer_conflict_other_error() -> None:
+    client, _ = _transfer_client({"errno": 12, "info": [{"errno": -6}]})
+    async with client:
+        with pytest.raises(TransferError):
+            await client.transfer(_transfer_info(), [11], "/我的资源")
+
+
+async def test_transfer_other_errno() -> None:
+    client, _ = _transfer_client({"errno": 5, "show_msg": "转存失败原因"})
+    async with client:
+        with pytest.raises(TransferError):
+            await client.transfer(_transfer_info(), [11], "/我的资源")
+
+
+async def test_transfer_requires_fs_ids() -> None:
+    client, _ = _transfer_client({"errno": 0})
+    async with client:
+        with pytest.raises(TransferError):
+            await client.transfer(_transfer_info(), [], "/我的资源")

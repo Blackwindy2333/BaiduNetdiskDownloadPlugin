@@ -20,6 +20,7 @@ from .errors import (
     PasswordRequiredError,
     ShareNotFoundError,
     ShareParseError,
+    TransferError,
 )
 from .models import ShareInfo, ShareNode, ShareTree
 from .utils import format_size
@@ -29,6 +30,7 @@ SHORTURL_API = "https://pan.baidu.com/api/shorturlinfo"
 TEMPLATE_API = "https://pan.baidu.com/api/gettemplatevariable"
 VERIFY_API = "https://pan.baidu.com/share/verify"
 LIST_API = "https://pan.baidu.com/share/list"
+TRANSFER_API = "https://pan.baidu.com/share/transfer"
 SHARE_PAGE = "https://pan.baidu.com/s/{surl}"
 
 BROWSER_UA = (
@@ -70,6 +72,14 @@ def parse_share_input(text: str, password: str = "") -> tuple[str, str]:
         pwd_match = _PWD_RE.search(raw)
         if pwd_match:
             pwd = pwd_match.group(1)
+    if not pwd:
+        # 兼容「链接 052x」这种裸提取码写法：在去掉 URL 后的剩余 token 中查找。
+        remainder = raw.replace(match.group(0), " ") if match else raw.replace(surl, " ")
+        for token in remainder.replace("，", " ").replace(",", " ").split():
+            candidate = token.strip(";；:：=提取码")
+            if candidate != surl and re.fullmatch(r"[A-Za-z0-9]{4,6}", candidate):
+                pwd = candidate
+                break
     return surl, pwd
 
 
@@ -368,6 +378,82 @@ class ShareClient:
         if errno not in {0}:
             raise ShareParseError(self._error_text(data) or "提取码校验失败。")
 
+    # -- 转存 -------------------------------------------------------------
+
+    async def transfer(self, info: ShareInfo, fs_ids: list[int | str], target_dir: str) -> dict[str, Any]:
+        """把选中 fs_id 转存到 ``target_dir``。
+
+        Returns:
+            ``{"own_share": bool, "filenames": list[str], "errno": int}``；
+            错误情况抛 ``TransferError``，自己的分享不抛错而是返回 ``own_share=True``。
+        """
+
+        normalized_ids = [str(item) for item in fs_ids if str(item).strip()]
+        if not normalized_ids:
+            raise TransferError("没有可转存的文件。")
+        params = {
+            "app_id": "250528",
+            "channel": "chunlei",
+            "clienttype": "0",
+            "web": "1",
+            "bdstoken": info.bdstoken,
+            "shareid": info.share_id,
+            "from": info.uk,
+        }
+        form = {
+            "fsidlist": "[" + ",".join(normalized_ids) + "]",
+            "path": target_dir,
+        }
+        referer = SHARE_PAGE.format(surl=shorturl_for_info(info.surl))
+        try:
+            response = await self._client.post(
+                TRANSFER_API,
+                params=params,
+                data=form,
+                headers={"Referer": referer},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError as exc:
+            raise TransferError("转存请求失败，请检查网络后重试。", detail=str(exc)) from exc
+        except ValueError as exc:
+            raise TransferError("转存接口返回格式异常。", detail=str(exc)) from exc
+        if not isinstance(data, dict):
+            raise TransferError("转存接口返回格式异常。")
+
+        errno = self._errno(data)
+        if errno == 0:
+            return {"own_share": False, "filenames": _extract_transfer_names(data), "errno": 0}
+        if errno == 4:
+            return {"own_share": False, "filenames": _extract_transfer_names(data), "errno": 4}
+        if errno == 2:
+            return {"own_share": True, "filenames": [], "errno": 2}
+        if errno == 12:
+            return self._handle_transfer_conflict(data)
+        raise TransferError(self._error_text(data) or f"转存失败（errno={errno}）。")
+
+    def _handle_transfer_conflict(self, data: dict[str, Any]) -> dict[str, Any]:
+        infos = data.get("info")
+        codes: set[int] = set()
+        if isinstance(infos, list):
+            for item in infos:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    codes.add(int(item.get("errno") or 0))
+                except (TypeError, ValueError):
+                    codes.add(0)
+        if codes and codes <= {-30, 0}:
+            return {"own_share": False, "filenames": _extract_transfer_names(data), "errno": 12}
+        message = self._error_text(data)
+        if -32 in codes or "空间不足" in message:
+            raise TransferError(
+                "网盘剩余空间不足，无法转存。请清理空间或改用单文件下载。",
+                detail=message,
+            )
+        raise TransferError("转存失败：目标目录存在同名冲突。", detail=message)
+
     # -- 目录树 -----------------------------------------------------------
 
     async def _list_dir(self, info: ShareInfo, dir_path: str, *, limit: int) -> list[ShareNode]:
@@ -463,6 +549,25 @@ class ShareClient:
 
 
 # --------------------------------------------------------------------------- 文案
+
+
+def _extract_transfer_names(data: dict[str, Any]) -> list[str]:
+    """从转存响应中提取目标文件名（兼容不同字段）。"""
+
+    extra = data.get("extra")
+    items: Any = extra.get("list") if isinstance(extra, dict) else None
+    if not isinstance(items, list):
+        items = data.get("list")
+    names: list[str] = []
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict):
+                name = item.get("to") or item.get("server_filename") or item.get("from") or item.get("name")
+                if name:
+                    names.append(str(name))
+            elif isinstance(item, str) and item.strip():
+                names.append(item.strip())
+    return names
 
 
 def render_tree(tree: ShareTree, *, max_entries: int = 60, title: str = "") -> str:

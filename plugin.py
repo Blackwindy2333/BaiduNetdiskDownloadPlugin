@@ -19,7 +19,8 @@ _PLUGIN_DIR = Path(__file__).resolve().parent
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
-from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin  # noqa: E402
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, MaiBotPlugin, Tool  # noqa: E402
+from maibot_sdk.types import ToolParamType, ToolParameterInfo  # noqa: E402
 
 from baidu_pan.__version__ import PLUGIN_NAME, PLUGIN_VERSION  # noqa: E402
 from baidu_pan.access import (  # noqa: E402
@@ -36,11 +37,18 @@ from baidu_pan.logging_utils import configure_logging, detach_file_handler  # no
 from baidu_pan.pcs_client import AccountInfo, PcsClient  # noqa: E402
 from baidu_pan.pcs_installer import PcsInstaller, binary_name  # noqa: E402
 from baidu_pan.qrlogin import QrLoginSession  # noqa: E402
+from baidu_pan.models import ShareTree  # noqa: E402
 from baidu_pan.share import (  # noqa: E402
     ShareClient,
     ShareSessionCache,
     parse_share_input,
     render_tree,
+)
+from baidu_pan.transfer import (  # noqa: E402
+    TransferResult,
+    root_nodes,
+    select_node,
+    transfer_nodes,
 )
 from baidu_pan.texts import (  # noqa: E402
     INVALID_TARGET_TEXT,
@@ -412,8 +420,8 @@ class BaiduPanPlugin(MaiBotPlugin):
             self._logger.debug("未读取到百度网盘登录信息，将匿名浏览分享：%s", exc)
         return ShareClient(cookies, timeout=20.0, logger=self._logger)
 
-    async def _cmd_browse(self, identity: Identity | None, raw: str, kwargs: dict[str, Any]) -> tuple[bool, str, int]:
-        """``/pan <链接> [提取码]``：解析并缓存当前分享目录树。"""
+    async def _browse_tree(self, raw: str, kwargs: dict[str, Any]) -> ShareTree:
+        """解析分享并构建目录树，同时写入当前会话缓存。"""
 
         surl, pwd = parse_share_input(raw)
         client = self._open_share_client()
@@ -427,14 +435,28 @@ class BaiduPanPlugin(MaiBotPlugin):
             )
         finally:
             await client.aclose()
-        key = self._stream_key(kwargs)
-        self._share_cache.put(key, tree)
+        self._share_cache.put(self._stream_key(kwargs), tree)
+        self._logger.info("已浏览分享 %s：%d 个节点", info.share_id, len(tree.nodes))
+        return tree
+
+    async def _tree_for(self, link: str, pwd: str, kwargs: dict[str, Any]) -> ShareTree:
+        """优先使用命令参数中的链接，否则读取当前会话缓存。"""
+
+        if link.strip():
+            return await self._browse_tree(f"{link.strip()} {pwd}".strip(), kwargs)
+        tree = self._share_cache.get(self._stream_key(kwargs), self.config.share.cache_ttl_minutes * 60)
+        if tree is None:
+            raise BaiduPanError(NO_SHARE_SESSION_TEXT)
+        return tree
+
+    async def _cmd_browse(self, identity: Identity | None, raw: str, kwargs: dict[str, Any]) -> tuple[bool, str, int]:
+        """``/pan <链接> [提取码]``：解析并缓存当前分享目录树。"""
+
+        tree = await self._browse_tree(raw, kwargs)
         self._logger.info(
-            "已浏览分享 %s：%d 个节点（用户 %s，会话 %s）",
-            info.share_id,
-            len(tree.nodes),
+            "浏览分享用户=%s，会话=%s",
             identity.key if identity is not None else "-",
-            key,
+            self._stream_key(kwargs),
         )
         return True, render_tree(tree, max_entries=self.config.share.entries_per_dir), 2
 
@@ -468,6 +490,119 @@ class BaiduPanPlugin(MaiBotPlugin):
         if tree is None:
             return True, NO_SHARE_SESSION_TEXT, 2
         return True, render_tree(tree, max_entries=self.config.share.entries_per_dir), 2
+
+    # ------------------------------------------------------------------ 转存
+
+    async def _transfer_selected(self, tree: ShareTree, nodes: list[Any]) -> TransferResult:
+        """执行转存；自家分享自动改为原路径直下，并可选做转存后校验。"""
+
+        account_uid: int | None = None
+        if self._pcs_executable().is_file():
+            try:
+                account = await self._make_pcs_client().who()
+                account_uid = account.uid if account is not None else None
+            except BaiduPanError as exc:
+                self._logger.debug("读取百度账号 uid 失败（不影响转存）：%s", exc)
+
+        client = self._open_share_client()
+        try:
+            result = await transfer_nodes(
+                client,
+                tree,
+                nodes,
+                target_dir=self.config.transfer.cloud_save_dir,
+                account_uid=account_uid,
+            )
+        finally:
+            await client.aclose()
+
+        if not result.own_share:
+            self._logger.info("已转存 %d 项到 %s", len(result.names), result.target_dir)
+            if self.config.transfer.verify_after_transfer:
+                await self._verify_transferred(result)
+        else:
+            self._logger.info("分享属于当前账号，跳过转存，直接使用原路径")
+        return result
+
+    async def _verify_transferred(self, result: TransferResult) -> None:
+        """转存后复查目标文件是否存在；失败只告警，不阻断后续下载。"""
+
+        pcs = self._make_pcs_client()
+        if not pcs.available:
+            return
+        try:
+            entries = await pcs.ls(result.target_dir)
+        except BaiduPanError as exc:
+            self._logger.warning("转存后校验失败（不影响下载）：%s", exc)
+            return
+        existing = {entry.name for entry in entries}
+        expected = {Path(name).name for name in result.filenames}
+        missing = expected - existing
+        if missing:
+            self._logger.warning("转存后未在目标目录找到：%s", "、".join(sorted(missing)))
+
+    # ------------------------------------------------------------------ LLM 工具
+
+    @Tool(
+        "pan_transfer",
+        brief_description="把百度网盘分享中的文件或目录转存到自己的网盘",
+        detailed_description=(
+            "当用户要求“转存/保存到我的网盘”时调用。"
+            "参数：link 为分享链接或 surl（可空，空时使用当前会话已浏览的分享）；"
+            "pwd 为提取码（可空）；path 为目录树中的文件/目录路径（可空，空时转存分享根目录全部内容）。"
+            "本工具只转存、不下载、不发送文件；需要白名单或管理员权限。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="link",
+                param_type=ToolParamType.STRING,
+                description="百度网盘分享链接或 surl；留空使用当前会话分享",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="pwd",
+                param_type=ToolParamType.STRING,
+                description="分享提取码；无提取码留空",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="path",
+                param_type=ToolParamType.STRING,
+                description="目录树中的文件/目录路径；留空表示分享根目录全部内容",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_pan_transfer(
+        self,
+        link: str = "",
+        pwd: str = "",
+        path: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if not self.config.plugin.enabled:
+            return {"content": PLUGIN_DISABLED_TEXT}
+        identity = extract_identity(kwargs)
+        try:
+            self._access().require_download(identity)
+            tree = await self._tree_for(link, pwd, kwargs)
+            nodes = [select_node(tree, path)] if path.strip() else root_nodes(tree)
+            result = await self._transfer_selected(tree, nodes)
+            if result.own_share:
+                names = "、".join(Path(item).name for item in result.direct_paths[:5]) or "全部内容"
+                return {
+                    "content": (
+                        f"该分享属于当前登录账号，无需转存；文件已在你的网盘：{names}。"
+                        "可以直接在网盘中使用它们。"
+                    )
+                }
+            names = "、".join(Path(name).name for name in result.filenames[:10]) or "全部内容"
+            return {"content": f"✅ 已转存到 {result.target_dir}：{names}"}
+        except BaiduPanError as exc:
+            return {"content": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - 工具返回值必须可读
+            self._logger.error("pan_transfer 异常：%s", exc, exc_info=True)
+            return {"content": "转存失败，请稍后重试或查看插件日志。"}
 
     # ------------------------------------------------------------------ BaiduPCS-Go 与登录
 

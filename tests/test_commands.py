@@ -146,10 +146,14 @@ class FakeShareClient:
     async def build_tree(self, info: ShareInfo, **kwargs) -> ShareTree:
         self.tree_kwargs = kwargs
         nodes = [
-            ShareNode(name="子目录", path="/子目录", is_dir=True),
-            ShareNode(name="说明.txt", path="/说明.txt", is_dir=False, size=2048),
+            ShareNode(name="子目录", path="/子目录", is_dir=True, fs_id=1),
+            ShareNode(name="说明.txt", path="/说明.txt", is_dir=False, size=2048, fs_id=2),
         ]
         return ShareTree(info=info, root_name="资料", nodes=nodes)
+
+    async def transfer(self, info: ShareInfo, fs_ids, target_dir: str):
+        self.transferred = (info.share_id, list(fs_ids), target_dir)
+        return {"own_share": False, "filenames": ["说明.txt"], "errno": 0}
 
     async def aclose(self) -> None:
         self.closed = True
@@ -332,3 +336,63 @@ async def test_qrlogin_starts_background_task(plugin_env, monkeypatch) -> None:
     assert task is not None
     await task
     assert ran == ["stream-qr"]
+
+
+async def test_pan_transfer_tool(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    FakeShareClient.instances.clear()
+    monkeypatch.setattr(plugin_module, "ShareClient", FakeShareClient)
+    monkeypatch.setattr(plugin_module, "load_cookie_header", lambda path: "")
+    apply_config(plugin_env.plugin, access={"admin_users": "qq:100"})
+
+    result = await plugin_env.plugin.tool_pan_transfer(
+        link="https://pan.baidu.com/s/1AbCdEf",
+        path="说明.txt",
+        platform="qq",
+        user_id="100",
+        stream_id="stream-transfer",
+    )
+    assert "已转存" in result["content"]
+    assert "/我的资源/AutoTransfer" in result["content"]
+    client = FakeShareClient.instances[-1]
+    assert client.transferred[1] == [2]
+
+
+async def test_pan_transfer_requires_whitelist(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    monkeypatch.setattr(plugin_module, "ShareClient", FakeShareClient)
+    monkeypatch.setattr(plugin_module, "load_cookie_header", lambda path: "")
+    apply_config(plugin_env.plugin, access={"admin_users": "qq:100"})
+
+    result = await plugin_env.plugin.tool_pan_transfer(
+        link="https://pan.baidu.com/s/1AbCdEf",
+        path="说明.txt",
+        platform="qq",
+        user_id="200",
+        stream_id="stream-denied",
+    )
+    assert "没有下载权限" in result["content"]
+
+
+async def test_pan_transfer_without_link_uses_cache(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    FakeShareClient.instances.clear()
+    monkeypatch.setattr(plugin_module, "ShareClient", FakeShareClient)
+    monkeypatch.setattr(plugin_module, "load_cookie_header", lambda path: "")
+    apply_config(plugin_env.plugin, access={"admin_users": "qq:100"})
+    plugin = plugin_env.plugin
+
+    success, _, _ = await plugin.handle_pan(
+        matched_groups={"args": "1AbCdEf"}, stream_id="stream-cache"
+    )
+    assert success is True
+    result = await plugin.tool_pan_transfer(
+        path="说明.txt",
+        platform="qq",
+        user_id="100",
+        stream_id="stream-cache",
+    )
+    assert "已转存" in result["content"]
