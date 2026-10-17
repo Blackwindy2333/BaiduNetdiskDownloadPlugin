@@ -8,7 +8,7 @@
 - [x] 1. 插件骨架、配置模型与日志系统
 - [x] 2. 管理员白名单与权限校验
 - [x] 3. 分享解析、目录浏览与会话缓存
-- [ ] 4. BaiduPCS-Go 镜像安装与账号登录
+- [x] 4. BaiduPCS-Go 镜像安装与账号登录
 - [ ] 5. 分享文件精确转存
 - [ ] 6. 下载任务、进度通知与文件发送
 - [ ] 7. 帮助、清理任务与项目文档
@@ -64,9 +64,8 @@ baidu_pan/
   account.py              # 读取 BaiduPCS-Go 登录态（pcs_config.json → Cookie）
   texts.py                # 用户可见中文文案（帮助/提示）
   utils.py                # 大小格式化、路径安全、原子 JSON、ID 解析
-  baidu_api.py            # httpx 客户端：shorturlinfo/gettemplatevariable/verify/list/transfer/QR
-  baidu_parser.py         # 链接/surl/提取码解析
   share.py                # 分享解析、密码校验、目录树构建与渲染、按 stream_id 的会话缓存
+  qrlogin.py              # Baidu Passport 二维码获取/轮询/Cookie 换取
   transfer.py             # 转存、errno 映射、空间/冲突处理、自家分享直下
   pcs_installer.py        # 镜像下载、大小+SHA256 校验、解压、安装
   pcs_client.py           # BaiduPCS-Go 子进程封装：env/CLI/超时/输出解析
@@ -75,14 +74,14 @@ baidu_pan/
   cleanup.py              # 下载文件清单 + 定时清理
 tests/
   conftest.py             # 假 ctx/logger/paths/send、httpx MockTransport
-  test_manifest.py test_config.py test_lifecycle.py test_access.py
-  test_parser.py test_share.py test_transfer.py test_pcs_installer.py
-  test_pcs_client.py test_download_manager.py test_sender.py test_commands.py
+  test_manifest.py test_config.py test_config_file.py test_lifecycle.py test_access.py
+  test_share.py test_transfer.py test_pcs_installer.py
+  test_pcs_client.py test_qrlogin.py test_download_manager.py test_sender.py test_commands.py
 docs/PLAN.md docs/ADAPTER.md docs/PROTOCOL.md
 README.md .gitignore requirements-dev.txt pytest.ini
 ```
 
-实现说明：为减少无意义分层，`baidu_api.py`/`baidu_parser.py` 的职责并入 `share.py`，会话缓存由 `ShareSessionCache` 承担；如后续协议扩展到转存/二维码，再评估是否拆分。
+实现说明：为减少无意义分层，`baidu_api.py`/`baidu_parser.py` 的职责并入 `share.py`，会话缓存由 `ShareSessionCache` 承担；二维码登录独立为 `qrlogin.py`。
 
 模块只通过显式构造注入依赖（config/access/api/pcs/sender），不读全局单例，便于后续加功能与测试。
 

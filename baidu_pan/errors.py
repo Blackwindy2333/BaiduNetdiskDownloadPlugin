@@ -70,6 +70,14 @@ class PcsError(BaiduPanError):
     default_message = "BaiduPCS-Go 执行失败，请查看日志获取详细信息。"
 
 
+class PcsTimeoutError(PcsError):
+    default_message = "BaiduPCS-Go 命令执行超时，请稍后重试。"
+
+
+class QrLoginError(BaiduPanError):
+    default_message = "扫码登录失败，请重新执行 /pan qrlogin。"
+
+
 class DownloadError(BaiduPanError):
     default_message = "下载失败，请稍后重试。"
 
@@ -88,7 +96,9 @@ __all__ = [
     "PasswordInvalidError",
     "PasswordRequiredError",
     "PcsError",
+    "PcsTimeoutError",
     "PermissionDeniedError",
+    "QrLoginError",
     "SendError",
     "ShareNotFoundError",
     "ShareParseError",

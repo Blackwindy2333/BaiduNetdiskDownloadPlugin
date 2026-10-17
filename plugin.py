@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,8 +31,11 @@ from baidu_pan.access import (  # noqa: E402
 )
 from baidu_pan.account import load_cookie_header  # noqa: E402
 from baidu_pan.config_file import ensure_config_file  # noqa: E402
-from baidu_pan.errors import BaiduPanError  # noqa: E402
+from baidu_pan.errors import BaiduPanError, PcsError  # noqa: E402
 from baidu_pan.logging_utils import configure_logging, detach_file_handler  # noqa: E402
+from baidu_pan.pcs_client import AccountInfo, PcsClient  # noqa: E402
+from baidu_pan.pcs_installer import PcsInstaller, binary_name  # noqa: E402
+from baidu_pan.qrlogin import QrLoginSession  # noqa: E402
 from baidu_pan.share import (  # noqa: E402
     ShareClient,
     ShareSessionCache,
@@ -68,6 +74,9 @@ class BaiduPanPlugin(MaiBotPlugin):
         self._file_handler: logging.Handler | None = None
         self._whitelist: WhitelistStore | None = None
         self._share_cache = ShareSessionCache()
+        self._pcs_lock = asyncio.Lock()
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._qr_task: asyncio.Task[Any] | None = None
         self._unloaded = False
 
     # ------------------------------------------------------------------ 生命周期
@@ -85,13 +94,20 @@ class BaiduPanPlugin(MaiBotPlugin):
         except OSError as exc:
             self._logger.error("白名单载入失败：%s", exc, exc_info=True)
         self._log_runtime_summary()
+        if self.config.account.auto_login and self.config.account.bduss:
+            self._logger.info("检测到自动登录配置，开始后台登录")
+            self._spawn(self._auto_login(), name="auto-login")
 
     async def on_unload(self) -> None:
-        """插件卸载：释放文件日志 handler，可重复调用。"""
+        """插件卸载：取消后台任务并释放文件日志 handler，可重复调用。"""
 
         if self._unloaded:
             return
         self._unloaded = True
+        for task in list(self._tasks):
+            task.cancel()
+        self._tasks.clear()
+        self._qr_task = None
         detach_file_handler(self._logger)
         self._file_handler = None
         self._logger.info("%s v%s 已卸载", PLUGIN_NAME, PLUGIN_VERSION)
@@ -164,6 +180,95 @@ class BaiduPanPlugin(MaiBotPlugin):
             "是" if self.config.sending.local_path_enabled else "否",
         )
 
+    # ------------------------------------------------------------------ 后台任务与 BaiduPCS-Go
+
+    def _spawn(self, coro: Any, *, name: str = "") -> asyncio.Task[Any]:
+        """创建后台任务并纳入卸载清理。"""
+
+        task = asyncio.create_task(coro, name=name or None)
+        self._tasks.add(task)
+        task.add_done_callback(self._handle_task_done)
+        return task
+
+    def _handle_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if task is self._qr_task:
+            self._qr_task = None
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._logger.error(
+                "后台任务异常：%s",
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    def _install_dir(self) -> Path:
+        return Path(self.ctx.paths.data_dir) / "bin"
+
+    def _pcs_config_dir(self) -> Path:
+        env_dir = os.environ.get("BAIDUPCS_GO_CONFIG_DIR", "").strip()
+        if env_dir:
+            return Path(env_dir)
+        custom = self.config.download.baidu_pcs_go_path.strip()
+        if custom:
+            return Path(custom).expanduser().resolve().parent
+        return self._install_dir()
+
+    def _pcs_executable(self) -> Path:
+        custom = self.config.download.baidu_pcs_go_path.strip()
+        if custom:
+            return Path(custom).expanduser()
+        return self._install_dir() / binary_name()
+
+    def _make_pcs_client(self) -> PcsClient:
+        return PcsClient(
+            self._pcs_executable(),
+            config_dir=self._pcs_config_dir(),
+            logger=self._logger,
+        )
+
+    def _make_installer(self) -> PcsInstaller:
+        return PcsInstaller(
+            self._install_dir(),
+            prefixes=[prefix.strip() for prefix in split_multi(self.config.download.pcs_download_prefixes)],
+            verify_checksum=self.config.download.pcs_verify_checksum,
+            logger=self._logger,
+        )
+
+    async def _ensure_pcs(self, *, force: bool = False) -> Path:
+        """确保 BaiduPCS-Go 可用，返回可执行文件路径。"""
+
+        custom = self.config.download.baidu_pcs_go_path.strip()
+        if custom:
+            path = Path(custom).expanduser()
+            if not path.is_file():
+                raise PcsError(f"配置的 BaiduPCS-Go 路径不存在：{path}")
+            return path
+        async with self._pcs_lock:
+            installer = self._make_installer()
+            return await installer.ensure(self.config.download.pcs_version, force=force)
+
+    async def _auto_login(self) -> None:
+        try:
+            client = self._make_pcs_client()
+            account = await client.login_bduss(self.config.account.bduss, self.config.account.stoken)
+            self._logger.info("自动登录成功：%s", account.name if account else "未知账号")
+        except BaiduPanError as exc:
+            self._logger.warning("自动登录失败：%s", exc)
+        except Exception as exc:  # noqa: BLE001 - 后台任务必须自吞异常
+            self._logger.error("自动登录异常：%s", exc, exc_info=True)
+
+    async def _send_text(self, stream_id: str, text: str) -> None:
+        if not stream_id:
+            self._logger.warning("缺少 stream_id，无法发送后台消息：%s", text[:80])
+            return
+        try:
+            await self.ctx.send.text(text, stream_id)
+        except Exception as exc:  # noqa: BLE001 - 发送失败只记录
+            self._logger.warning("后台消息发送失败：%s", exc)
+
     # ------------------------------------------------------------------ 命令
 
     @Command(
@@ -205,6 +310,13 @@ class BaiduPanPlugin(MaiBotPlugin):
                 "status": self._cmd_status,
                 "ls": self._cmd_ls,
                 "look": self._cmd_look,
+                "install": self._cmd_install,
+                "download": self._cmd_install,
+                "qrlogin": self._cmd_qrlogin,
+                "bduss": self._cmd_bduss,
+                "cookies": self._cmd_cookies,
+                "login": self._cmd_login,
+                "unlogin": self._cmd_unlogin,
             }.get(subcommand)
             if handler is not None:
                 return await handler(identity, rest, kwargs)
@@ -356,6 +468,121 @@ class BaiduPanPlugin(MaiBotPlugin):
         if tree is None:
             return True, NO_SHARE_SESSION_TEXT, 2
         return True, render_tree(tree, max_entries=self.config.share.entries_per_dir), 2
+
+    # ------------------------------------------------------------------ BaiduPCS-Go 与登录
+
+    async def _cmd_install(
+        self, identity: Identity | None, rest: str, kwargs: dict[str, Any]
+    ) -> tuple[bool, str, int]:
+        """``/pan install [force]`` 或 ``/pan download``：安装 BaiduPCS-Go。"""
+
+        policy = self._access()
+        policy.require_manage(identity)
+        force = rest.strip().lower() in {"force", "-f", "--force", "重装"}
+        path = await self._ensure_pcs(force=force)
+        version = self.config.download.pcs_version
+        return True, f"BaiduPCS-Go {version} 已就绪：{path}", 2
+
+    async def _cmd_login(
+        self, identity: Identity | None, rest: str, kwargs: dict[str, Any]
+    ) -> tuple[bool, str, int]:
+        """``/pan login <账号> <密码>``。"""
+
+        policy = self._access()
+        policy.require_manage(identity)
+        parts = rest.split(maxsplit=1)
+        if len(parts) < 2:
+            return True, "用法：/pan login <百度账号> <密码>（推荐使用 /pan qrlogin 扫码登录）", 2
+        client = self._make_pcs_client()
+        account = await client.login_password(parts[0], parts[1])
+        return True, _login_success_text(account), 2
+
+    async def _cmd_bduss(
+        self, identity: Identity | None, rest: str, kwargs: dict[str, Any]
+    ) -> tuple[bool, str, int]:
+        """``/pan bduss <BDUSS> [STOKEN]``。"""
+
+        policy = self._access()
+        policy.require_manage(identity)
+        parts = rest.split()
+        if not parts:
+            return True, "用法：/pan bduss <BDUSS> [STOKEN]", 2
+        client = self._make_pcs_client()
+        account = await client.login_bduss(parts[0], parts[1] if len(parts) > 1 else "")
+        return True, _login_success_text(account), 2
+
+    async def _cmd_cookies(
+        self, identity: Identity | None, rest: str, kwargs: dict[str, Any]
+    ) -> tuple[bool, str, int]:
+        """``/pan cookies <浏览器 Cookie 字符串>``。"""
+
+        policy = self._access()
+        policy.require_manage(identity)
+        if not rest.strip():
+            return True, "用法：/pan cookies <完整 Cookie 字符串>", 2
+        client = self._make_pcs_client()
+        account = await client.login_cookies(rest.strip())
+        return True, _login_success_text(account), 2
+
+    async def _cmd_unlogin(
+        self, identity: Identity | None, rest: str, kwargs: dict[str, Any]
+    ) -> tuple[bool, str, int]:
+        """``/pan unlogin``：退出百度账号。"""
+
+        policy = self._access()
+        policy.require_manage(identity)
+        client = self._make_pcs_client()
+        result = await client.logout()
+        if result.code != 0 or result.contains_error_words():
+            raise PcsError("退出登录失败，请稍后重试。", detail=result.output)
+        self._logger.info("已退出百度账号")
+        return True, "已退出百度账号登录。", 2
+
+    async def _cmd_qrlogin(
+        self, identity: Identity | None, rest: str, kwargs: dict[str, Any]
+    ) -> tuple[bool, str, int]:
+        """``/pan qrlogin``：后台获取二维码并等待扫码。"""
+
+        policy = self._access()
+        policy.require_manage(identity)
+        if self._qr_task is not None and not self._qr_task.done():
+            return True, "扫码登录已在进行中，请先完成手机确认。", 2
+        stream_id = str(kwargs.get("stream_id") or "")
+        self._qr_task = self._spawn(self._qr_login_flow(stream_id), name="qrlogin")
+        return True, "正在准备扫码登录，请稍候…", 2
+
+    async def _qr_login_flow(self, stream_id: str) -> None:
+        """后台扫码登录流程：发二维码 → 轮询 → 用 Cookie 登录 BaiduPCS-Go。"""
+
+        session = QrLoginSession(logger=self._logger)
+        try:
+            await self._ensure_pcs()
+            qr = await session.create()
+            image_base64 = base64.b64encode(qr.image).decode("ascii")
+            await self.ctx.send.image(image_base64, stream_id)
+            await self._send_text(stream_id, "请使用百度 App 扫描二维码，并在手机上确认登录。二维码约 3 分钟内有效。")
+            credentials, _scanned = await session.wait_for_scan(qr.sign)
+            client = self._make_pcs_client()
+            account = await client.login_cookies(credentials.cookies)
+            await self._send_text(stream_id, _login_success_text(account))
+            self._logger.info("扫码登录成功：%s", account.name if account else "未知账号")
+        except BaiduPanError as exc:
+            self._logger.warning("扫码登录失败：%s", exc)
+            await self._send_text(stream_id, str(exc))
+        except Exception as exc:  # noqa: BLE001 - 后台任务必须自吞异常
+            self._logger.error("扫码登录异常：%s", exc, exc_info=True)
+            await self._send_text(stream_id, "扫码登录失败，请稍后重试或改用 /pan bduss。")
+        finally:
+            await session.aclose()
+
+
+def _login_success_text(account: AccountInfo | None) -> str:
+    """生成登录成功提示（不输出任何凭据）。"""
+
+    if account is None or account.uid <= 0:
+        return "登录成功，但未能读取账号信息，可使用 /pan status 检查。"
+    name = account.name or "未知账号"
+    return f"登录成功：{name}（uid {account.uid}）"
 
 
 def create_plugin() -> BaiduPanPlugin:

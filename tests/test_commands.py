@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from conftest import apply_config
 from baidu_pan.errors import AuthError
 from baidu_pan.models import ShareInfo, ShareNode, ShareTree
+from baidu_pan.pcs_client import AccountInfo, PcsResult
 from baidu_pan.texts import PLUGIN_DISABLED_TEXT, UNKNOWN_COMMAND_TEXT
 
 
@@ -222,3 +225,110 @@ async def test_ls_refreshes_cached_share(plugin_env, monkeypatch) -> None:
     assert success is True
     assert "📁 资料" in text
     assert FakeShareClient.instances[-1].resolved == ("1AbCdEf", "")
+
+
+class FakePcsClient:
+    """假 BaiduPCS-Go 客户端，记录命令并返回固定账号。"""
+
+    calls: list[tuple[str, tuple]] = []
+
+    def __init__(self, executable, *, config_dir=None, logger=None) -> None:
+        self.executable = executable
+        self.config_dir = config_dir
+
+    async def login_bduss(self, bduss: str, stoken: str = "") -> AccountInfo:
+        FakePcsClient.calls.append(("login_bduss", (bduss, stoken)))
+        return AccountInfo(uid=100, name="测试账号")
+
+    async def login_cookies(self, cookies: str) -> AccountInfo:
+        FakePcsClient.calls.append(("login_cookies", (cookies,)))
+        return AccountInfo(uid=100, name="测试账号")
+
+    async def login_password(self, username: str, password: str) -> AccountInfo:
+        FakePcsClient.calls.append(("login_password", (username, password)))
+        return AccountInfo(uid=100, name="测试账号")
+
+    async def logout(self) -> PcsResult:
+        FakePcsClient.calls.append(("logout", ()))
+        return PcsResult(code=0, stdout="退出登录成功\n")
+
+
+async def test_install_command_uses_configured_path(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    exe = plugin_env.tmp_path / "BaiduPCS-Go.exe"
+    exe.write_bytes(b"stub")
+    apply_config(
+        plugin_env.plugin,
+        access={"admin_users": "qq:100"},
+        download={"baidu_pcs_go_path": str(exe)},
+    )
+    success, text, _ = await plugin_env.plugin.handle_pan(
+        **_admin_kwargs(args="install")
+    )
+    assert success is True
+    assert "已就绪" in text
+    assert str(exe) in text
+
+    # 非管理员不能安装
+    success, text, _ = await plugin_env.plugin.handle_pan(
+        **_admin_kwargs(user_id="200", args="install")
+    )
+    assert success is True
+    assert "仅管理员" in text
+
+
+async def test_login_commands(plugin_env, monkeypatch) -> None:
+    import plugin as plugin_module
+
+    FakePcsClient.calls.clear()
+    monkeypatch.setattr(plugin_module, "PcsClient", FakePcsClient)
+    apply_config(plugin_env.plugin, access={"admin_users": "qq:100"})
+    plugin = plugin_env.plugin
+
+    success, text, _ = await plugin.handle_pan(**_admin_kwargs(args="bduss abc123 stoken456"))
+    assert success is True
+    assert "登录成功" in text
+    assert ("login_bduss", ("abc123", "stoken456")) in FakePcsClient.calls
+
+    success, text, _ = await plugin.handle_pan(**_admin_kwargs(args="cookies BDUSS=x; STOKEN=y"))
+    assert success is True
+    assert any(call[0] == "login_cookies" for call in FakePcsClient.calls)
+
+    success, text, _ = await plugin.handle_pan(**_admin_kwargs(args="login user pass"))
+    assert success is True
+    assert any(call[0] == "login_password" for call in FakePcsClient.calls)
+
+    success, text, _ = await plugin.handle_pan(**_admin_kwargs(args="unlogin"))
+    assert success is True
+    assert "已退出" in text
+
+
+async def test_login_command_requires_arguments(plugin_env) -> None:
+    apply_config(plugin_env.plugin, access={"admin_users": "qq:100"})
+    success, text, _ = await plugin_env.plugin.handle_pan(**_admin_kwargs(args="login onlyuser"))
+    assert success is True
+    assert "用法" in text
+    success, text, _ = await plugin_env.plugin.handle_pan(**_admin_kwargs(args="cookies"))
+    assert success is True
+    assert "用法" in text
+
+
+async def test_qrlogin_starts_background_task(plugin_env, monkeypatch) -> None:
+    apply_config(plugin_env.plugin, access={"admin_users": "qq:100"})
+    plugin = plugin_env.plugin
+    ran: list[str] = []
+
+    async def fake_flow(stream_id: str) -> None:
+        ran.append(stream_id)
+
+    monkeypatch.setattr(plugin, "_qr_login_flow", fake_flow)
+    success, text, _ = await plugin.handle_pan(
+        **_admin_kwargs(args="qrlogin"), stream_id="stream-qr"
+    )
+    assert success is True
+    assert "正在准备扫码登录" in text
+    task = plugin._qr_task
+    assert task is not None
+    await task
+    assert ran == ["stream-qr"]
