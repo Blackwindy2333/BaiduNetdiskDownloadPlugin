@@ -282,6 +282,24 @@ async def test_install_command_uses_configured_path(plugin_env, monkeypatch) -> 
     assert "仅管理员" in text
 
 
+async def test_install_git_direct(plugin_env, monkeypatch) -> None:
+    from pathlib import Path
+
+    apply_config(plugin_env.plugin, access={"admin_users": "qq:100"})
+    plugin = plugin_env.plugin
+    captured: list[dict] = []
+
+    async def fake_ensure(**kwargs):
+        captured.append(kwargs)
+        return Path("BaiduPCS-Go")
+
+    monkeypatch.setattr(plugin, "_ensure_pcs", fake_ensure)
+    success, text, _ = await plugin.handle_pan(**_admin_kwargs(args="install --git force"))
+    assert success is True
+    assert "GitHub 直连" in text
+    assert captured == [{"force": True, "direct_only": True}]
+
+
 async def test_login_commands(plugin_env, monkeypatch) -> None:
     import plugin as plugin_module
 

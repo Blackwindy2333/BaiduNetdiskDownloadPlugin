@@ -275,15 +275,18 @@ class BaiduPanPlugin(MaiBotPlugin):
             logger=self._logger,
         )
 
-    def _make_installer(self) -> PcsInstaller:
+    def _make_installer(self, *, direct_only: bool = False) -> PcsInstaller:
+        prefixes: list[str] = []
+        if not direct_only:
+            prefixes = [prefix.strip() for prefix in split_multi(self.config.download.pcs_download_prefixes)]
         return PcsInstaller(
             self._install_dir(),
-            prefixes=[prefix.strip() for prefix in split_multi(self.config.download.pcs_download_prefixes)],
+            prefixes=prefixes,
             verify_checksum=self.config.download.pcs_verify_checksum,
             logger=self._logger,
         )
 
-    async def _ensure_pcs(self, *, force: bool = False) -> Path:
+    async def _ensure_pcs(self, *, force: bool = False, direct_only: bool = False) -> Path:
         """确保 BaiduPCS-Go 可用，返回可执行文件路径。"""
 
         custom = self.config.download.baidu_pcs_go_path.strip()
@@ -293,7 +296,7 @@ class BaiduPanPlugin(MaiBotPlugin):
                 raise PcsError(f"配置的 BaiduPCS-Go 路径不存在：{path}")
             return path
         async with self._pcs_lock:
-            installer = self._make_installer()
+            installer = self._make_installer(direct_only=direct_only)
             return await installer.ensure(self.config.download.pcs_version, force=force)
 
     async def _auto_login(self) -> None:
@@ -995,14 +998,17 @@ class BaiduPanPlugin(MaiBotPlugin):
     async def _cmd_install(
         self, identity: Identity | None, rest: str, kwargs: dict[str, Any]
     ) -> tuple[bool, str, int]:
-        """``/pan install [force]`` 或 ``/pan download``：安装 BaiduPCS-Go。"""
+        """``/pan install [force|--git]`` 或 ``/pan download``：安装 BaiduPCS-Go。"""
 
         policy = self._access()
         policy.require_manage(identity)
-        force = rest.strip().lower() in {"force", "-f", "--force", "重装"}
-        path = await self._ensure_pcs(force=force)
+        tokens = {token.strip().lower() for token in rest.split() if token.strip()}
+        force = bool(tokens & {"force", "-f", "--force", "重装"})
+        direct_only = bool(tokens & {"git", "--git"})
+        path = await self._ensure_pcs(force=force, direct_only=direct_only)
         version = self.config.download.pcs_version
-        return True, f"BaiduPCS-Go {version} 已就绪：{path}", 2
+        source = "GitHub 直连" if direct_only else "镜像优先"
+        return True, f"BaiduPCS-Go {version} 已就绪（{source}）：{path}", 2
 
     async def _cmd_login(
         self, identity: Identity | None, rest: str, kwargs: dict[str, Any]

@@ -126,7 +126,7 @@
 | `/pan look` | 所有人 | 查看当前缓存的目录树 |
 | `/pan file <路径>`（别名 `f`） | 管理员/白名单 | 下载单个文件并发送 |
 | `/pan dir <路径>`（别名 `folder`/`fl`） | 管理员/白名单 | 下载整个目录并发送 |
-| `/pan install [force]`（别名 `download`） | 管理员 | 安装/更新 BaiduPCS-Go（`force` 强制重装） |
+| `/pan install [force\|--git]`（别名 `download`） | 管理员 | 安装/更新 BaiduPCS-Go（`force` 强制重装，`--git` 跳过镜像直连 GitHub） |
 | `/pan qrlogin` | 管理员 | 扫码登录（后台轮询，二维码约 3 分钟有效） |
 | `/pan bduss <BDUSS> [STOKEN]` | 管理员 | BDUSS 登录 |
 | `/pan cookies <Cookie>` | 管理员 | Cookie 登录 |

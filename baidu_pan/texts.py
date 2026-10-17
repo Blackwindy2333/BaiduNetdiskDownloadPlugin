@@ -71,7 +71,8 @@ def build_help_text() -> str:
 【下载】
 /pan file <路径> 下载单个文件并发送
 /pan dir <路径> 下载整个目录并发送
-/pan download [--git] 安装/更新 BaiduPCS-Go
+/pan install [force|--git] 安装/更新 BaiduPCS-Go
+（--git 强制 GitHub 直连；别名 /pan download）
 
 【账号】（仅管理员）
 /pan qrlogin 扫码登录（推荐）
