@@ -117,6 +117,7 @@ class SendOutcome:
     transport: str
     detail: str = ""
     fallback_used: bool = False
+    leftover_path: str = ""
     sent_at: str = field(default_factory=now_iso)
 
 

@@ -31,13 +31,16 @@ from baidu_pan.access import (  # noqa: E402
     parse_target_identity,
 )
 from baidu_pan.account import load_cookie_header  # noqa: E402
+from baidu_pan.cleanup import FileManifest  # noqa: E402
 from baidu_pan.config_file import ensure_config_file  # noqa: E402
-from baidu_pan.errors import BaiduPanError, PcsError  # noqa: E402
+from baidu_pan.download_manager import DownloadManager, DownloadRequest  # noqa: E402
+from baidu_pan.errors import AuthError, BaiduPanError, DownloadError, PcsError  # noqa: E402
 from baidu_pan.logging_utils import configure_logging, detach_file_handler  # noqa: E402
 from baidu_pan.pcs_client import AccountInfo, PcsClient  # noqa: E402
 from baidu_pan.pcs_installer import PcsInstaller, binary_name  # noqa: E402
 from baidu_pan.qrlogin import QrLoginSession  # noqa: E402
-from baidu_pan.models import ShareTree  # noqa: E402
+from baidu_pan.models import ShareNode, ShareTree  # noqa: E402
+from baidu_pan.sender import FileSender  # noqa: E402
 from baidu_pan.share import (  # noqa: E402
     ShareClient,
     ShareSessionCache,
@@ -63,7 +66,7 @@ from baidu_pan.texts import (  # noqa: E402
     whitelist_missing_text,
     whitelist_removed_text,
 )
-from baidu_pan.utils import normalize_account, split_multi  # noqa: E402
+from baidu_pan.utils import build_job_id, format_size, normalize_account, split_multi  # noqa: E402
 from config import BaiduPanConfig  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -85,6 +88,9 @@ class BaiduPanPlugin(MaiBotPlugin):
         self._pcs_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._qr_task: asyncio.Task[Any] | None = None
+        self._sender: FileSender | None = None
+        self._manifest: FileManifest | None = None
+        self._downloads: DownloadManager | None = None
         self._unloaded = False
 
     # ------------------------------------------------------------------ 生命周期
@@ -101,6 +107,7 @@ class BaiduPanPlugin(MaiBotPlugin):
             self._logger.info("白名单已载入：%d 人（%s）", store.count(), store.path)
         except OSError as exc:
             self._logger.error("白名单载入失败：%s", exc, exc_info=True)
+        self._ensure_runtime()
         self._log_runtime_summary()
         if self.config.account.auto_login and self.config.account.bduss:
             self._logger.info("检测到自动登录配置，开始后台登录")
@@ -112,6 +119,12 @@ class BaiduPanPlugin(MaiBotPlugin):
         if self._unloaded:
             return
         self._unloaded = True
+        if self._downloads is not None:
+            try:
+                await self._downloads.shutdown()
+            except Exception as exc:  # noqa: BLE001 - 卸载不抛错
+                self._logger.warning("停止下载任务时出现异常：%s", exc)
+            self._downloads = None
         for task in list(self._tasks):
             task.cancel()
         self._tasks.clear()
@@ -126,6 +139,8 @@ class BaiduPanPlugin(MaiBotPlugin):
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         self._apply_logging()
+        if self._downloads is not None:
+            self._downloads.set_download_root(self._download_root())
         self._logger.info("%s 配置已更新（config_version=%s）", PLUGIN_NAME, version)
 
     # ------------------------------------------------------------------ 内部方法
@@ -277,6 +292,43 @@ class BaiduPanPlugin(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001 - 发送失败只记录
             self._logger.warning("后台消息发送失败：%s", exc)
 
+    def _download_root(self) -> Path:
+        custom = self.config.download.download_dir.strip()
+        if custom:
+            return Path(custom).expanduser()
+        return Path(self.ctx.paths.data_dir) / "downloads"
+
+    def _staging_dir(self) -> Path:
+        custom = self.config.sending.staging_dir.strip()
+        if custom:
+            return Path(custom).expanduser()
+        return Path(self.ctx.paths.data_dir) / "upload_cache"
+
+    def _ensure_runtime(self) -> None:
+        """创建文件发送器、清单与下载管理器（幂等）。"""
+
+        if self._sender is not None:
+            return
+        data_dir = Path(self.ctx.paths.data_dir)
+        self._manifest = FileManifest(data_dir / "state" / "cleanup_manifest.json", self._logger)
+        self._sender = FileSender(
+            self.ctx.send,
+            config_provider=lambda: self.config,
+            staging_dir_provider=self._staging_dir,
+            logger=self._logger,
+            on_leftover=lambda path: self._manifest.add([path]) if self._manifest is not None else None,
+        )
+        self._downloads = DownloadManager(
+            config_provider=lambda: self.config,
+            pcs_factory=self._make_pcs_client,
+            sender=self._sender,
+            notify=self._send_text,
+            download_root=self._download_root(),
+            manifest=self._manifest,
+            logger=self._logger,
+            max_concurrent=self.config.download.max_concurrent_jobs,
+        )
+
     # ------------------------------------------------------------------ 命令
 
     @Command(
@@ -325,6 +377,11 @@ class BaiduPanPlugin(MaiBotPlugin):
                 "cookies": self._cmd_cookies,
                 "login": self._cmd_login,
                 "unlogin": self._cmd_unlogin,
+                "file": self._cmd_file,
+                "f": self._cmd_file,
+                "dir": self._cmd_dir,
+                "folder": self._cmd_dir,
+                "fl": self._cmd_dir,
             }.get(subcommand)
             if handler is not None:
                 return await handler(identity, rest, kwargs)
@@ -541,6 +598,139 @@ class BaiduPanPlugin(MaiBotPlugin):
         if missing:
             self._logger.warning("转存后未在目标目录找到：%s", "、".join(sorted(missing)))
 
+    # ------------------------------------------------------------------ 下载
+
+    @staticmethod
+    def _share_url(tree: ShareTree) -> str:
+        base = f"https://pan.baidu.com/s/{tree.info.surl}"
+        return f"{base}?pwd={tree.info.pwd}" if tree.info.pwd else base
+
+    @staticmethod
+    def _node_total_size(tree: ShareTree, node: ShareNode) -> int:
+        if not node.is_dir:
+            return node.size
+        prefix = node.path.rstrip("/") + "/"
+        return sum(
+            item.size
+            for item in tree.nodes
+            if item.path == node.path or item.path.startswith(prefix)
+        )
+
+    def _size_limit_error(self, size: int, label: str) -> str | None:
+        limit_mb = int(self.config.transfer.max_file_size_mb)
+        if limit_mb <= 0:
+            return None
+        limit = limit_mb * 1024 * 1024
+        if size > limit:
+            return f"{label}大小 {format_size(size)} 超过配置上限 {limit_mb}MB，已拒绝处理。"
+        return None
+
+    def _start_download(
+        self,
+        tree: ShareTree,
+        nodes: list[ShareNode],
+        kwargs: dict[str, Any],
+        identity: Identity | None,
+        *,
+        display_name: str = "",
+    ) -> str:
+        """创建后台下载流程，返回任务 ID。"""
+
+        self._ensure_runtime()
+        job_id = build_job_id("dl")
+        name = display_name or (nodes[0].name if len(nodes) == 1 else f"{len(nodes)} 项内容")
+        self._spawn(
+            self._download_flow(job_id, tree, nodes, kwargs, identity, name),
+            name=f"download-{job_id}",
+        )
+        return job_id
+
+    async def _download_flow(
+        self,
+        job_id: str,
+        tree: ShareTree,
+        nodes: list[ShareNode],
+        kwargs: dict[str, Any],
+        identity: Identity | None,
+        display_name: str,
+    ) -> None:
+        """后台流程：登录检查 → 转存 → 交给 DownloadManager 下载并发送。"""
+
+        stream_id = str(kwargs.get("stream_id") or "")
+        expected_size = sum(self._node_total_size(tree, node) for node in nodes)
+        try:
+            await self._ensure_pcs()
+            pcs = self._make_pcs_client()
+            account = await pcs.who()
+            if account is None:
+                raise AuthError("尚未登录百度网盘，请先使用 /pan qrlogin 登录。")
+            await self._send_text(stream_id, f"⏳ 正在转存「{display_name}」…")
+            transfer = await self._transfer_selected(tree, nodes)
+            if transfer.own_share:
+                cloud_paths = transfer.direct_paths
+                cleanup_paths: list[str] = []
+            else:
+                target = transfer.target_dir.rstrip("/")
+                cloud_paths = [f"{target}/{Path(name).name}" for name in transfer.filenames]
+                cleanup_paths = [transfer.target_dir] if self.config.transfer.auto_delete_cloud else []
+            expected_names = [Path(path).name for path in cloud_paths]
+            request = DownloadRequest(
+                job_id=job_id,
+                stream_id=stream_id,
+                platform=identity.platform if identity is not None else "qq",
+                user_id=identity.user_id if identity is not None else "",
+                display_name=display_name,
+                cloud_paths=cloud_paths,
+                cleanup_cloud_paths=cleanup_paths,
+                share_url=self._share_url(tree),
+                expected_size=expected_size,
+                expected_names=expected_names,
+            )
+            if self._downloads is None:
+                raise DownloadError("下载管理器尚未初始化。")
+            self._downloads.submit(request)
+        except BaiduPanError as exc:
+            self._logger.warning("下载准备失败：job=%s %s", job_id, exc)
+            await self._send_text(stream_id, f"❌ {display_name} 处理失败：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 后台任务自吞异常
+            self._logger.error("下载准备异常：job=%s %s", job_id, exc, exc_info=True)
+            await self._send_text(stream_id, f"❌ {display_name} 处理失败，请查看插件日志。")
+
+    async def _cmd_file(self, identity: Identity | None, rest: str, kwargs: dict[str, Any]) -> tuple[bool, str, int]:
+        """``/pan file <路径>``：下载单个文件。"""
+
+        policy = self._access()
+        policy.require_download(identity)
+        if not rest.strip():
+            return True, "用法：/pan file <目录树中的文件路径>", 2
+        tree = await self._tree_for("", "", kwargs)
+        node = select_node(tree, rest.strip())
+        if node.is_dir:
+            return True, f"「{node.name}」是目录，请使用 /pan dir {node.path}。", 2
+        error = self._size_limit_error(node.size, "文件")
+        if error:
+            return True, error, 2
+        job_id = self._start_download(tree, [node], kwargs, identity)
+        return True, f"✅ 已受理文件下载：{node.name}（{format_size(node.size)}，任务 {job_id}）。完成后会自动发送。", 2
+
+    async def _cmd_dir(self, identity: Identity | None, rest: str, kwargs: dict[str, Any]) -> tuple[bool, str, int]:
+        """``/pan dir <路径>``：下载整个目录。"""
+
+        policy = self._access()
+        policy.require_download(identity)
+        if not rest.strip():
+            return True, "用法：/pan dir <目录树中的目录路径>", 2
+        tree = await self._tree_for("", "", kwargs)
+        node = select_node(tree, rest.strip())
+        if not node.is_dir:
+            return True, f"「{node.name}」是文件，请使用 /pan file {node.path}。", 2
+        size = self._node_total_size(tree, node)
+        error = self._size_limit_error(size, "目录")
+        if error:
+            return True, error, 2
+        job_id = self._start_download(tree, [node], kwargs, identity)
+        return True, f"✅ 已受理目录下载：{node.name}（{format_size(size)}，任务 {job_id}）。完成后会发送文件。", 2
+
     # ------------------------------------------------------------------ LLM 工具
 
     @Tool(
@@ -603,6 +793,127 @@ class BaiduPanPlugin(MaiBotPlugin):
         except Exception as exc:  # noqa: BLE001 - 工具返回值必须可读
             self._logger.error("pan_transfer 异常：%s", exc, exc_info=True)
             return {"content": "转存失败，请稍后重试或查看插件日志。"}
+
+    @Tool(
+        "pan_download_dir",
+        brief_description="下载百度网盘分享中的文件或目录并发送到聊天",
+        detailed_description=(
+            "当用户要求“下载分享里的某个文件/文件夹”时调用。"
+            "参数：folder_path 为目录树中的文件或目录路径（必填）；"
+            "link 为分享链接或 surl（可空，空时使用当前会话分享）；pwd 为提取码（可空）。"
+            "工具会先精确转存，再交给 BaiduPCS-Go 后台下载，完成后把文件发送到当前聊天；"
+            "需要白名单或管理员权限，受最大文件大小限制。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="folder_path",
+                param_type=ToolParamType.STRING,
+                description="目录树中的文件或目录路径",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="link",
+                param_type=ToolParamType.STRING,
+                description="百度网盘分享链接或 surl；留空使用当前会话分享",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="pwd",
+                param_type=ToolParamType.STRING,
+                description="分享提取码；无提取码留空",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_pan_download_dir(
+        self,
+        folder_path: str = "",
+        link: str = "",
+        pwd: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if not self.config.plugin.enabled:
+            return {"content": PLUGIN_DISABLED_TEXT}
+        identity = extract_identity(kwargs)
+        try:
+            self._access().require_download(identity)
+            if not folder_path.strip():
+                return {"content": "请提供目录树中的文件或目录路径。"}
+            tree = await self._tree_for(link, pwd, kwargs)
+            node = select_node(tree, folder_path)
+            size = self._node_total_size(tree, node)
+            error = self._size_limit_error(size, "目标")
+            if error:
+                return {"content": error}
+            job_id = self._start_download(tree, [node], kwargs, identity)
+            label = "目录" if node.is_dir else "文件"
+            return {
+                "content": (
+                    f"✅ 已受理{label}下载：{node.name}（{format_size(size)}，任务 {job_id}）。"
+                    "下载完成后会自动发送到当前聊天。"
+                )
+            }
+        except BaiduPanError as exc:
+            return {"content": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            self._logger.error("pan_download_dir 异常：%s", exc, exc_info=True)
+            return {"content": "下载失败，请稍后重试或查看插件日志。"}
+
+    @Tool(
+        "pan_download_all",
+        brief_description="下载百度网盘分享中的全部内容并发送到聊天",
+        detailed_description=(
+            "当用户要求“把整个分享都下载下来”时调用。"
+            "参数：link 为分享链接或 surl（可空，空时使用当前会话分享）；pwd 为提取码（可空）。"
+            "会转存分享根目录全部内容并后台下载，逐项发送文件；"
+            "需要白名单或管理员权限；目标总量超过配置上限时会拒绝。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="link",
+                param_type=ToolParamType.STRING,
+                description="百度网盘分享链接或 surl；留空使用当前会话分享",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="pwd",
+                param_type=ToolParamType.STRING,
+                description="分享提取码；无提取码留空",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_pan_download_all(
+        self,
+        link: str = "",
+        pwd: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        if not self.config.plugin.enabled:
+            return {"content": PLUGIN_DISABLED_TEXT}
+        identity = extract_identity(kwargs)
+        try:
+            self._access().require_download(identity)
+            tree = await self._tree_for(link, pwd, kwargs)
+            nodes = root_nodes(tree)
+            if not nodes:
+                return {"content": "当前分享根目录没有可下载的内容。"}
+            size = sum(self._node_total_size(tree, node) for node in nodes)
+            error = self._size_limit_error(size, "分享内容")
+            if error:
+                return {"content": error}
+            job_id = self._start_download(tree, nodes, kwargs, identity, display_name="分享全部内容")
+            return {
+                "content": (
+                    f"✅ 已受理全部内容下载（{len(nodes)} 项，{format_size(size)}，任务 {job_id}）。"
+                    "下载完成后会发送到当前聊天。"
+                )
+            }
+        except BaiduPanError as exc:
+            return {"content": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            self._logger.error("pan_download_all 异常：%s", exc, exc_info=True)
+            return {"content": "下载失败，请稍后重试或查看插件日志。"}
 
     # ------------------------------------------------------------------ BaiduPCS-Go 与登录
 

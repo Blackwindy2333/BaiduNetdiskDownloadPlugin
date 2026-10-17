@@ -11,10 +11,14 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .errors import PcsError, PcsTimeoutError
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+_PROGRESS_RE = re.compile(r"↓\s*(\S+)/(\S+)")
+_SPEED_RE = re.compile(r"↓\s*\S+/\S+\s+(\S+)/s")
 
 _LIST_LINE_RE = re.compile(
     r"^\s*\d+\s+\d+\s+\d+\s+(\S+)\s+"
@@ -63,6 +67,16 @@ class DownloadOutcome:
     success: bool
     result: PcsResult
     failed_lines: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DownloadProgress:
+    """下载进度（来自 BaiduPCS-Go 的 \\r 进度行）。"""
+
+    downloaded: int
+    total: int
+    percent: float
+    speed: str = ""
 
 
 def _decode(data: bytes) -> str:
@@ -232,6 +246,7 @@ class PcsClient:
         *,
         overwrite: bool = True,
         timeout: float,
+        on_progress: Callable[[DownloadProgress], None] | None = None,
     ) -> DownloadOutcome:
         saveto.mkdir(parents=True, exist_ok=True)
         args = ["download"]
@@ -239,7 +254,10 @@ class PcsClient:
             args.append("--ow")
         args.extend(["--saveto", str(saveto)])
         args.extend(paths)
-        result = await self.run(args, timeout=timeout)
+        if on_progress is None:
+            result = await self.run(args, timeout=timeout)
+        else:
+            result = await self._run_streaming(args, timeout=timeout, on_progress=on_progress)
         failed_lines = [
             line.strip()
             for line in result.stdout.splitlines()
@@ -247,11 +265,89 @@ class PcsClient:
         ]
         success = (
             result.code == 0
-            and "下载结束" in result.output
+            and "下载结束" in result.stdout
             and not failed_lines
             and not result.contains_error_words()
         )
         return DownloadOutcome(success=success, result=result, failed_lines=failed_lines)
+
+    async def _run_streaming(
+        self,
+        args: list[str],
+        *,
+        timeout: float,
+        on_progress: Callable[[DownloadProgress], None],
+    ) -> PcsResult:
+        """执行下载命令并逐行解析进度；stderr 合并进 stdout。"""
+
+        started = time.monotonic()
+        environment = self._environment()
+        kwargs: dict[str, object] = {
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.STDOUT,
+            "stdin": asyncio.subprocess.DEVNULL,
+            "env": environment,
+        }
+        if _CREATE_NO_WINDOW:
+            kwargs["creationflags"] = _CREATE_NO_WINDOW
+        try:
+            process = await asyncio.create_subprocess_exec(str(self._executable), *args, **kwargs)
+        except OSError as exc:
+            raise PcsError("无法启动 BaiduPCS-Go，请检查文件权限。", detail=str(exc)) from exc
+        assert process.stdout is not None
+
+        collected: list[str] = []
+        buffer = ""
+
+        def emit(line: str) -> None:
+            try:
+                progress = _parse_progress(line)
+            except ValueError:
+                return
+            if progress is not None:
+                try:
+                    on_progress(progress)
+                except Exception:  # noqa: BLE001 - 进度回调不允许影响下载
+                    pass
+
+        async def reader() -> None:
+            nonlocal buffer
+            while True:
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    break
+                text = _decode(chunk)
+                collected.append(text)
+                buffer += text
+                parts = re.split(r"[\r\n]+", buffer)
+                buffer = parts.pop()
+                for line in parts:
+                    emit(line)
+            if buffer:
+                emit(buffer)
+
+        reader_task = asyncio.create_task(reader())
+        try:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+            raise PcsTimeoutError("BaiduPCS-Go 下载超时，已终止进程。") from exc
+        finally:
+            try:
+                await asyncio.wait_for(reader_task, timeout=5)
+            except Exception:  # noqa: BLE001 - 读取任务异常不影响结果
+                reader_task.cancel()
+
+        return PcsResult(
+            code=process.returncode or 0,
+            stdout="".join(collected),
+            stderr="",
+            duration=time.monotonic() - started,
+        )
 
     async def rm(self, path: str) -> PcsResult:
         return await self.run(["rm", path], timeout=30)
@@ -271,6 +367,26 @@ def _mask(text: str, keep: int = 6) -> str:
     if len(stripped) <= keep * 2:
         return "***"
     return f"{stripped[:keep]}…{stripped[-keep:]}"
+
+
+def _parse_progress(line: str) -> DownloadProgress | None:
+    """解析 ``[0] ↓ 1.00MB/2.00MB 3.4MB/s in ...`` 形式的进度行。"""
+
+    match = _PROGRESS_RE.search(line)
+    if match is None:
+        return None
+    downloaded = _parse_size(match.group(1))
+    total = _parse_size(match.group(2))
+    if total <= 0:
+        return None
+    speed_match = _SPEED_RE.search(line)
+    speed = f"{speed_match.group(1)}/s" if speed_match else ""
+    return DownloadProgress(
+        downloaded=downloaded,
+        total=total,
+        percent=min(100.0, downloaded / total * 100),
+        speed=speed,
+    )
 
 
 def _parse_size(token: str) -> int:
@@ -295,6 +411,7 @@ def _parse_size(token: str) -> int:
 __all__ = [
     "AccountInfo",
     "DownloadOutcome",
+    "DownloadProgress",
     "PcsClient",
     "PcsResult",
     "RemoteEntry",

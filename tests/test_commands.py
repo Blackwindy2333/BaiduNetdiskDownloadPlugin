@@ -396,3 +396,109 @@ async def test_pan_transfer_without_link_uses_cache(plugin_env, monkeypatch) -> 
         stream_id="stream-cache",
     )
     assert "已转存" in result["content"]
+
+
+async def _prepare_browsed_share(plugin_env, monkeypatch, stream_id: str = "stream-dl") -> None:
+    import plugin as plugin_module
+
+    monkeypatch.setattr(plugin_module, "ShareClient", FakeShareClient)
+    monkeypatch.setattr(plugin_module, "load_cookie_header", lambda path: "")
+    apply_config(plugin_env.plugin, access={"admin_users": "qq:100"})
+    success, _, _ = await plugin_env.plugin.handle_pan(
+        matched_groups={"args": "1AbCdEf"}, stream_id=stream_id
+    )
+    assert success is True
+
+
+async def test_file_command_starts_download(plugin_env, monkeypatch) -> None:
+    plugin = plugin_env.plugin
+    await _prepare_browsed_share(plugin_env, monkeypatch, "stream-file")
+    started: list[str] = []
+
+    def fake_start(tree, nodes, kwargs, identity, *, display_name=""):
+        started.append(nodes[0].name)
+        return "job-x"
+
+    monkeypatch.setattr(plugin, "_start_download", fake_start)
+    success, text, _ = await plugin.handle_pan(
+        **_admin_kwargs(args="file 说明.txt"), stream_id="stream-file"
+    )
+    assert success is True
+    assert "已受理文件下载" in text
+    assert "job-x" in text
+    assert started == ["说明.txt"]
+
+
+async def test_file_and_dir_path_type_check(plugin_env, monkeypatch) -> None:
+    plugin = plugin_env.plugin
+    await _prepare_browsed_share(plugin_env, monkeypatch, "stream-type")
+    monkeypatch.setattr(plugin, "_start_download", lambda *args, **kwargs: "job-x")
+
+    success, text, _ = await plugin.handle_pan(
+        **_admin_kwargs(args="file 子目录"), stream_id="stream-type"
+    )
+    assert success is True
+    assert "是目录" in text
+
+    success, text, _ = await plugin.handle_pan(
+        **_admin_kwargs(args="dir 说明.txt"), stream_id="stream-type"
+    )
+    assert success is True
+    assert "是文件" in text
+
+    success, text, _ = await plugin.handle_pan(
+        **_admin_kwargs(args="file"), stream_id="stream-type"
+    )
+    assert success is True
+    assert "用法" in text
+
+
+async def test_download_requires_whitelist(plugin_env, monkeypatch) -> None:
+    plugin = plugin_env.plugin
+    await _prepare_browsed_share(plugin_env, monkeypatch, "stream-deny")
+    success, text, _ = await plugin.handle_pan(
+        **_admin_kwargs(user_id="200", args="file 说明.txt"), stream_id="stream-deny"
+    )
+    assert success is True
+    assert "没有下载权限" in text
+
+
+async def test_download_tools_start_jobs(plugin_env, monkeypatch) -> None:
+    plugin = plugin_env.plugin
+    await _prepare_browsed_share(plugin_env, monkeypatch, "stream-tools")
+    started: list[str] = []
+
+    def fake_start(tree, nodes, kwargs, identity, *, display_name=""):
+        started.append(display_name or nodes[0].name)
+        return "job-tools"
+
+    monkeypatch.setattr(plugin, "_start_download", fake_start)
+
+    result = await plugin.tool_pan_download_dir(
+        folder_path="子目录",
+        platform="qq",
+        user_id="100",
+        stream_id="stream-tools",
+    )
+    assert "已受理目录下载" in result["content"]
+    assert "job-tools" in result["content"]
+
+    result = await plugin.tool_pan_download_all(
+        platform="qq",
+        user_id="100",
+        stream_id="stream-tools",
+    )
+    assert "已受理全部内容下载" in result["content"]
+    assert started
+
+
+async def test_download_tool_requires_whitelist(plugin_env, monkeypatch) -> None:
+    plugin = plugin_env.plugin
+    await _prepare_browsed_share(plugin_env, monkeypatch, "stream-tool-deny")
+    result = await plugin.tool_pan_download_dir(
+        folder_path="子目录",
+        platform="qq",
+        user_id="200",
+        stream_id="stream-tool-deny",
+    )
+    assert "没有下载权限" in result["content"]
