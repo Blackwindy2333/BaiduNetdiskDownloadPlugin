@@ -147,11 +147,18 @@ class PcsClient:
                 process.communicate(payload),
                 timeout=timeout if timeout is not None else self._default_timeout,
             )
+        except asyncio.CancelledError:
+            process.kill()
+            try:
+                await asyncio.wait_for(process.communicate(), timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            raise
         except asyncio.TimeoutError as exc:
             process.kill()
             try:
                 await asyncio.wait_for(process.communicate(), timeout=10)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
             raise PcsTimeoutError("BaiduPCS-Go 命令执行超时。") from exc
 
@@ -328,16 +335,26 @@ class PcsClient:
         reader_task = asyncio.create_task(reader())
         try:
             await asyncio.wait_for(process.wait(), timeout=timeout)
+        except asyncio.CancelledError:
+            process.kill()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            raise
         except asyncio.TimeoutError as exc:
             process.kill()
             try:
                 await asyncio.wait_for(process.wait(), timeout=10)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
             raise PcsTimeoutError("BaiduPCS-Go 下载超时，已终止进程。") from exc
         finally:
             try:
                 await asyncio.wait_for(reader_task, timeout=5)
+            except asyncio.CancelledError:
+                reader_task.cancel()
+                raise
             except Exception:  # noqa: BLE001 - 读取任务异常不影响结果
                 reader_task.cancel()
 

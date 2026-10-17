@@ -129,3 +129,14 @@ async def test_run_timeout_kills_process(tmp_path: Path) -> None:
     client = PcsClient(Path(sys.executable), timeout=10)
     with pytest.raises(PcsTimeoutError):
         await client.run(["-c", "import time; time.sleep(5)"], timeout=0.2)
+
+
+async def test_run_cancellation_kills_process(tmp_path: Path) -> None:
+    import asyncio
+
+    client = PcsClient(Path(sys.executable), timeout=10)
+    task = asyncio.create_task(client.run(["-c", "import time; time.sleep(5)"], timeout=10))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
